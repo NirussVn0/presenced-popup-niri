@@ -13,6 +13,7 @@ dist/
 build/
 out/
 .turbo/
+.worktrees/
 
 # Logs & temp
 *.log
