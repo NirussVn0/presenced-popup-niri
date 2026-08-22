@@ -14,7 +14,7 @@ export const WidgetPlacementSchema = z.object({
   lane: WidgetLaneSchema,
   size: WidgetSizePresetSchema,
   visible: z.boolean(),
-});
+}).strict();
 
 export const ClusterLayoutV1Schema = z.object({
   version: z.literal(1),
@@ -22,7 +22,7 @@ export const ClusterLayoutV1Schema = z.object({
   rightVisible: z.boolean(),
   editMode: z.boolean(),
   placements: z.array(WidgetPlacementSchema),
-}).superRefine((layout, ctx) => {
+}).strict().superRefine((layout, ctx) => {
   const ids = new Set<string>();
   for (const placement of layout.placements) {
     if (ids.has(placement.widgetId)) {
