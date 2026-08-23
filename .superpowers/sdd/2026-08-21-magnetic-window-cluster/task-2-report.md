@@ -9,7 +9,7 @@ PASS — implementation and focused verification complete.
 - This report: `.superpowers/sdd/2026-08-21-magnetic-window-cluster/task-2-report.md`
 
 ## Commit SHA
-d02da5b2f64f5bc244292e0c71e7a4603c84cebf
+b038da16165aa1511270d1eaa6b4b24059221328
 
 ## Tests and results
 - `pnpm exec vitest run apps/popup/src/__tests__/window-cluster-layout.test.ts` — PASS, 1 file / 9 tests.
