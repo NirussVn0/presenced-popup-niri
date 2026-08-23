@@ -188,3 +188,59 @@ PASS
 ```
 
 Generated `tsconfig.tsbuildinfo` changes were restored after gates; no generated build artifacts are included in the scoped diff. No live Tauri/Niri GUI smoke test was run; native behavior remains covered by the reviewed Task 4 Rust implementation plus the behavioral bridge tests above.
+
+## Important review fix round 2 (2026-08-23)
+
+### Multi-root and lifecycle fixes
+
+- `WidgetWindowShell` now uses `useWidgetWindowActions`, a lightweight action-only hook with no mount-time GET, WebSocket subscription, native initialization, or global geometry apply. `useWindowCluster` remains mounted only by the main dashboard and is the sole cluster controller.
+- Optional close performs one bounded GET plus one persisted PUT. The daemon's real `widget.layout.changed` event is the only cross-window evidence; the main controller receives it and performs exactly one `apply_widget_layout`. Optional roots do not invoke `hide_widget_window` or apply global geometry.
+- Controller actions now capture an `AbortController` when they begin, persistence PUTs receive the signal, cleanup aborts every in-flight action request, and queued operations re-check mount state before execution.
+- Toggle, hide, commit, cancel, and settings actions guard at queue entry. Every post-await persistence/native/state transition is guarded. `openSettings` separately guards after lookup and after show so unmount prevents later show/focus work.
+- The optional hide queue also guards execution, aborts its in-flight GET/PUT on cleanup, and drops queued hides after unmount.
+
+### Behavioral RED evidence
+
+Before the production refactor:
+
+```text
+pnpm exec vitest run apps/popup/src/__tests__/use-window-cluster.test.tsx apps/popup/src/__tests__/widget-window-shell.test.tsx
+FAIL — 7 failed, 8 passed
+- two optional shells created three cluster WebSockets instead of one;
+- queued controller actions persisted after unmount;
+- persistence requests carried no abort signal;
+- settings showed/focused after unmount;
+- optional hide had no lightweight abortable one-shot path;
+- WidgetWindowShell still requested the full useWindowCluster hook.
+```
+
+### Behavioral coverage added
+
+- Three independently mounted React roots (one main controller plus two optional shells) prove one cluster WebSocket, one startup GET, one `initialize_widget_windows` owner, and no startup `apply_widget_layout` owner duplication.
+- An optional close proves exactly one PUT and exactly one main-controller `apply_widget_layout`, including an event delivered before the PUT response, with no `hide_widget_window` race.
+- Deterministic deferred tests queue toggle/hide/commit/cancel/openSettings behind an in-flight action, unmount, release the blocker, and prove no subsequent save, native apply, settings lookup, or React layout mutation.
+- Additional deferred tests prove in-flight persistence is aborted with no later native/state effect, lookup completion cannot show/focus after unmount, show completion cannot focus after unmount, and an in-flight optional hide plus its queued successor cannot save after cleanup.
+
+### Final verification evidence
+
+```text
+pnpm exec vitest run apps/popup/src/__tests__/use-window-cluster.test.tsx apps/popup/src/__tests__/widget-window-shell.test.tsx apps/popup/src/__tests__/window-root.test.tsx apps/popup/src/__tests__/niri-popup-config.test.ts apps/daemon/src/__tests__/widget-layout-api.test.ts
+PASS — 5 files, 42 tests
+
+pnpm run typecheck
+PASS — contracts, core, daemon, popup, web
+
+pnpm run test
+PASS — unfiltered 47 files, 176 tests
+
+pnpm run lint
+PASS
+
+pnpm run build
+PASS — contracts/core TypeScript, daemon tsup, web Vite (1634 modules), popup Vite (2056 modules)
+
+git diff --check
+PASS
+```
+
+Generated `tsconfig.tsbuildinfo` changes were restored after gates. The scoped fix contains only the cluster hook, optional shell, behavioral tests, and this report. No live Tauri/Niri GUI smoke test was run and no native runtime claim is made.

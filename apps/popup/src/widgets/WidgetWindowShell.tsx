@@ -1,7 +1,7 @@
 import type { ReactNode } from "react";
 import type { WidgetWindowId } from "@presenced/contracts";
 import { X } from "lucide-react";
-import { useWindowCluster } from "../hooks/useWindowCluster.js";
+import { useWidgetWindowActions } from "../hooks/useWindowCluster.js";
 
 interface WidgetWindowShellProps {
   widgetId: WidgetWindowId;
@@ -10,7 +10,7 @@ interface WidgetWindowShellProps {
 }
 
 export function WidgetWindowShell({ widgetId, title, children }: WidgetWindowShellProps) {
-  const { hideWidget } = useWindowCluster();
+  const { hideWidget } = useWidgetWindowActions();
   const hide = () => {
     void hideWidget(widgetId);
   };

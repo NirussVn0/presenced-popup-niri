@@ -29,6 +29,7 @@ import {
   useWindowCluster,
   type UseWindowClusterReturn,
 } from "../hooks/useWindowCluster.js";
+import { WidgetWindowShell } from "../widgets/WidgetWindowShell.js";
 
 const INITIAL_LAYOUT: ClusterLayoutV1 = {
   ...DEFAULT_CLUSTER_LAYOUT,
@@ -97,6 +98,7 @@ function deferred<T>() {
 
 let latest: UseWindowClusterReturn;
 let renderer: ReactTestRenderer | null;
+let extraRenderers: ReactTestRenderer[];
 let fetchHandler: (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
 
 function HookHarness() {
@@ -147,6 +149,7 @@ beforeEach(() => {
     .IS_REACT_ACT_ENVIRONMENT = true;
   ControlledWebSocket.instances = [];
   renderer = null;
+  extraRenderers = [];
   latest = undefined as unknown as UseWindowClusterReturn;
   tauri.invoke.mockReset().mockResolvedValue(undefined);
   tauri.getByLabel.mockReset();
@@ -161,8 +164,11 @@ beforeEach(() => {
 });
 
 afterEach(async () => {
-  if (renderer) {
-    await act(async () => renderer?.unmount());
+  if (renderer || extraRenderers.length > 0) {
+    await act(async () => {
+      renderer?.unmount();
+      for (const extraRenderer of extraRenderers) extraRenderer.unmount();
+    });
   }
   vi.unstubAllGlobals();
 });
@@ -402,5 +408,211 @@ describe("useWindowCluster ordered mutations", () => {
 
     expect(tauri.invoke).toHaveBeenCalledWith("hide_widget_window", { widgetId: "music" });
     expect(latest.layout).toEqual(hidden);
+  });
+});
+
+describe("window cluster multi-root ownership", () => {
+  it("keeps optional shells lightweight and applies their persisted hide once in the main controller", async () => {
+    const socket = await mountReady();
+
+    await act(async () => {
+      extraRenderers.push(
+        create(
+          <WidgetWindowShell widgetId="music" title="Music">
+            <div>music</div>
+          </WidgetWindowShell>,
+        ),
+        create(
+          <WidgetWindowShell widgetId="lyrics" title="Lyrics">
+            <div>lyrics</div>
+          </WidgetWindowShell>,
+        ),
+      );
+    });
+
+    expect(ControlledWebSocket.instances).toHaveLength(1);
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(tauri.invoke.mock.calls.filter(([command]) => command === "initialize_widget_windows"))
+      .toHaveLength(1);
+    expect(tauri.invoke.mock.calls.filter(([command]) => command === "apply_widget_layout"))
+      .toHaveLength(0);
+
+    const hidden = {
+      ...INITIAL_LAYOUT,
+      placements: [{ ...INITIAL_LAYOUT.placements[0]!, visible: false }],
+    };
+    fetchHandler = async (_input, init) => {
+      if (init?.method === "PUT") {
+        socket.message({ type: "widget.layout.changed", payload: hidden });
+        return response(hidden);
+      }
+      return response(INITIAL_LAYOUT);
+    };
+
+    const close = extraRenderers[0]!.root.findByProps({ "aria-label": "Hide Music" });
+    await act(async () => close.props.onClick());
+    await until(() => expect(latest.layout).toEqual(hidden));
+
+    expect(ControlledWebSocket.instances).toHaveLength(1);
+    expect(fetch).toHaveBeenCalledTimes(3);
+    expect((fetch as ReturnType<typeof vi.fn>).mock.calls.filter(([, init]) => init?.method === "PUT"))
+      .toHaveLength(1);
+    expect(tauri.invoke.mock.calls.filter(([command]) => command === "initialize_widget_windows"))
+      .toHaveLength(1);
+    expect(tauri.invoke.mock.calls.filter(([command]) => command === "apply_widget_layout"))
+      .toEqual([["apply_widget_layout", { layout: hidden }]]);
+    expect(tauri.invoke.mock.calls.filter(([command]) => command === "hide_widget_window"))
+      .toHaveLength(0);
+  });
+});
+
+describe("window cluster action cleanup", () => {
+  it("cancels queued toggle, hide, commit, cancel, and settings actions when unmounted", async () => {
+    const entering = deferred<unknown>();
+    await mountReady();
+    tauri.invoke.mockClear();
+    (fetch as ReturnType<typeof vi.fn>).mockClear();
+    tauri.invoke.mockImplementation((command: string) =>
+      command === "set_cluster_edit_mode" ? entering.promise : Promise.resolve(),
+    );
+
+    let actions!: Promise<void>[];
+    await act(async () => {
+      actions = [
+        latest.enterEdit(),
+        latest.toggleSide("left"),
+        latest.hideWidget("music"),
+        latest.commitEdit(),
+        latest.cancelEdit(),
+        latest.openSettings(),
+      ];
+      await Promise.resolve();
+    });
+    expect(tauri.invoke.mock.calls).toEqual([
+      ["set_cluster_edit_mode", { enabled: true }],
+    ]);
+
+    await act(async () => renderer?.unmount());
+    renderer = null;
+    entering.resolve(undefined);
+    await act(async () => {
+      await Promise.all(actions);
+    });
+
+    expect(fetch).not.toHaveBeenCalled();
+    expect(tauri.invoke.mock.calls).toEqual([
+      ["set_cluster_edit_mode", { enabled: true }],
+    ]);
+    expect(tauri.getByLabel).not.toHaveBeenCalled();
+    expect(latest.layout).toEqual(INITIAL_LAYOUT);
+  });
+
+  it("aborts in-flight persistence and performs no native or state effect after unmount", async () => {
+    const put = deferred<Response>();
+    let putSignal: AbortSignal | undefined;
+    fetchHandler = async (_input, init) => {
+      if (init?.method === "PUT") {
+        putSignal = init.signal ?? undefined;
+        return put.promise;
+      }
+      return response(INITIAL_LAYOUT);
+    };
+    await mountReady();
+    tauri.invoke.mockClear();
+
+    let action!: Promise<void>;
+    await act(async () => {
+      action = latest.toggleSide("left");
+      await Promise.resolve();
+    });
+    await until(() => expect(putSignal).toBeDefined());
+
+    await act(async () => renderer?.unmount());
+    renderer = null;
+    expect(putSignal?.aborted).toBe(true);
+    put.resolve(response({ ...INITIAL_LAYOUT, leftVisible: true }));
+    await act(async () => action);
+
+    expect(tauri.invoke).not.toHaveBeenCalled();
+    expect(latest.layout).toEqual(INITIAL_LAYOUT);
+  });
+
+  it("does not show or focus settings when lookup finishes after unmount", async () => {
+    const lookup = deferred<{ show: ReturnType<typeof vi.fn>; setFocus: ReturnType<typeof vi.fn> }>();
+    const settings = {
+      show: vi.fn().mockResolvedValue(undefined),
+      setFocus: vi.fn().mockResolvedValue(undefined),
+    };
+    tauri.getByLabel.mockReturnValue(lookup.promise);
+    await mountReady();
+
+    const action = latest.openSettings();
+    await until(() => expect(tauri.getByLabel).toHaveBeenCalledWith("settings"));
+    await act(async () => renderer?.unmount());
+    renderer = null;
+    lookup.resolve(settings);
+    await act(async () => action);
+
+    expect(settings.show).not.toHaveBeenCalled();
+    expect(settings.setFocus).not.toHaveBeenCalled();
+  });
+
+  it("does not focus settings when show finishes after unmount", async () => {
+    const shown = deferred<void>();
+    const settings = {
+      show: vi.fn(() => shown.promise),
+      setFocus: vi.fn().mockResolvedValue(undefined),
+    };
+    tauri.getByLabel.mockResolvedValue(settings);
+    await mountReady();
+
+    const action = latest.openSettings();
+    await until(() => expect(settings.show).toHaveBeenCalledOnce());
+    await act(async () => renderer?.unmount());
+    renderer = null;
+    shown.resolve();
+    await act(async () => action);
+
+    expect(settings.setFocus).not.toHaveBeenCalled();
+  });
+
+  it("aborts an in-flight optional hide and drops its queued hide before either can save", async () => {
+    const get = deferred<Response>();
+    let getSignal: AbortSignal | undefined;
+    fetchHandler = async (_input, init) => {
+      if (!init?.method) {
+        getSignal = init?.signal ?? undefined;
+        return get.promise;
+      }
+      return response(JSON.parse(String(init.body)));
+    };
+
+    let shell!: ReactTestRenderer;
+    await act(async () => {
+      shell = create(
+        <WidgetWindowShell widgetId="music" title="Music">
+          <div>music</div>
+        </WidgetWindowShell>,
+      );
+      extraRenderers.push(shell);
+    });
+    const close = shell.root.findByProps({ "aria-label": "Hide Music" });
+    await act(async () => {
+      close.props.onClick();
+      close.props.onClick();
+      await Promise.resolve();
+    });
+    await until(() => expect(getSignal).toBeDefined());
+
+    await act(async () => shell.unmount());
+    extraRenderers = [];
+    expect(getSignal?.aborted).toBe(true);
+    get.resolve(response(INITIAL_LAYOUT));
+    await flush();
+
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect((fetch as ReturnType<typeof vi.fn>).mock.calls.filter(([, init]) => init?.method === "PUT"))
+      .toHaveLength(0);
+    expect(tauri.invoke).not.toHaveBeenCalled();
   });
 });

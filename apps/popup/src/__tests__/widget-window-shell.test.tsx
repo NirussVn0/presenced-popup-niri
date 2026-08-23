@@ -13,7 +13,7 @@ const { act, create } = createRequire(import.meta.url)(
 const cluster = vi.hoisted(() => ({ hideWidget: vi.fn() }));
 
 vi.mock("../hooks/useWindowCluster.js", () => ({
-  useWindowCluster: () => ({ hideWidget: cluster.hideWidget }),
+  useWidgetWindowActions: () => ({ hideWidget: cluster.hideWidget }),
 }));
 
 import { WidgetWindowShell } from "../widgets/WidgetWindowShell.js";
@@ -34,7 +34,7 @@ afterEach(async () => {
 });
 
 describe("WidgetWindowShell", () => {
-  it("routes its close control through the persisted cluster hide action", async () => {
+  it("routes its close control through the lightweight persisted hide action", async () => {
     await act(async () => {
       renderer = create(
         <WidgetWindowShell widgetId="music" title="Music">

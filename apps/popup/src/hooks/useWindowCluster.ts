@@ -69,11 +69,12 @@ async function loadLayout(signal?: AbortSignal): Promise<ClusterLayoutV1> {
   return parsed.data;
 }
 
-async function saveLayout(layout: ClusterLayoutV1): Promise<ClusterLayoutV1> {
+async function saveLayout(layout: ClusterLayoutV1, signal?: AbortSignal): Promise<ClusterLayoutV1> {
   const response = await fetch(LAYOUT_URL, {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(layout),
+    ...(signal ? { signal } : {}),
   });
   if (!response.ok) {
     throw new Error(`Failed to save widget layout (HTTP ${response.status})`);
@@ -83,6 +84,16 @@ async function saveLayout(layout: ClusterLayoutV1): Promise<ClusterLayoutV1> {
     throw new Error("Daemon returned an invalid saved widget layout");
   }
   return parsed.data;
+}
+
+function actionIsActive(mounted: { current: boolean }, signal: AbortSignal): boolean {
+  return mounted.current && !signal.aborted;
+}
+
+function requireActiveAction(mounted: { current: boolean }, signal: AbortSignal): void {
+  if (!actionIsActive(mounted, signal)) {
+    throw new DOMException("Window cluster action was aborted", "AbortError");
+  }
 }
 
 function incrementExpectedEcho(echoes: Map<string, number>, layout: ClusterLayoutV1) {
@@ -110,6 +121,7 @@ export function useWindowCluster(): UseWindowClusterReturn {
   const mountedRef = useRef(false);
   const operationQueueRef = useRef<Promise<void>>(Promise.resolve());
   const expectedEchoesRef = useRef(new Map<string, number>());
+  const actionControllersRef = useRef(new Set<AbortController>());
 
   const acceptCommittedLayout = useCallback((next: ClusterLayoutV1) => {
     if (!mountedRef.current) return;
@@ -125,15 +137,23 @@ export function useWindowCluster(): UseWindowClusterReturn {
   }, []);
 
   const enqueueOperation = useCallback((operation: () => Promise<void>): Promise<void> => {
-    const result = operationQueueRef.current.then(operation, operation);
+    if (!mountedRef.current) return Promise.resolve();
+    const runIfMounted = async () => {
+      if (!mountedRef.current) return;
+      await operation();
+    };
+    const result = operationQueueRef.current.then(runIfMounted, runIfMounted);
     operationQueueRef.current = result.catch(() => undefined);
     return result;
   }, []);
 
-  const saveWithEcho = useCallback(async (next: ClusterLayoutV1) => {
+  const saveWithEcho = useCallback(async (next: ClusterLayoutV1, signal: AbortSignal) => {
+    requireActiveAction(mountedRef, signal);
     incrementExpectedEcho(expectedEchoesRef.current, next);
     try {
-      return await saveLayout(next);
+      const saved = await saveLayout(next, signal);
+      requireActiveAction(mountedRef, signal);
+      return saved;
     } catch (saveError) {
       consumeExpectedEcho(expectedEchoesRef.current, next);
       throw saveError;
@@ -261,37 +281,55 @@ export function useWindowCluster(): UseWindowClusterReturn {
       active = false;
       mountedRef.current = false;
       abortController.abort();
+      for (const controller of actionControllersRef.current) controller.abort();
+      actionControllersRef.current.clear();
       socket?.close();
       expectedEchoesRef.current.clear();
     };
   }, [acceptCommittedLayout, applyDaemonLayout, enqueueOperation]);
 
-  const runAction = useCallback((action: () => Promise<void>, fallback: string) =>
-    enqueueOperation(async () => {
+  const runAction = useCallback((
+    action: (signal: AbortSignal) => Promise<void>,
+    fallback: string,
+  ): Promise<void> => {
+    if (!mountedRef.current) return Promise.resolve();
+    return enqueueOperation(async () => {
+      if (!mountedRef.current) return;
+      const controller = new AbortController();
+      actionControllersRef.current.add(controller);
       try {
-        await action();
-        if (mountedRef.current) setError(null);
+        requireActiveAction(mountedRef, controller.signal);
+        await action(controller.signal);
+        if (actionIsActive(mountedRef, controller.signal)) setError(null);
       } catch (actionError) {
-        if (mountedRef.current) setError(errorMessage(actionError, fallback));
+        if (actionIsActive(mountedRef, controller.signal)) {
+          setError(errorMessage(actionError, fallback));
+        }
+      } finally {
+        actionControllersRef.current.delete(controller);
       }
-    }), [enqueueOperation]);
+    });
+  }, [enqueueOperation]);
 
   const persistThenApply = useCallback(async (
     previous: ClusterLayoutV1,
     candidate: ClusterLayoutV1,
     applyNative: (saved: ClusterLayoutV1) => Promise<void>,
     rollbackNative: (restored: ClusterLayoutV1) => Promise<void>,
+    signal: AbortSignal,
   ) => {
-    const saved = await saveWithEcho(candidate);
-    if (!mountedRef.current) return;
+    requireActiveAction(mountedRef, signal);
+    const saved = await saveWithEcho(candidate, signal);
+    if (!actionIsActive(mountedRef, signal)) return;
     try {
       await applyNative(saved);
     } catch (nativeError) {
+      if (!actionIsActive(mountedRef, signal)) return;
       try {
-        const restored = await saveWithEcho(previous);
-        if (!mountedRef.current) return;
+        const restored = await saveWithEcho(previous, signal);
+        if (!actionIsActive(mountedRef, signal)) return;
         await rollbackNative(restored);
-        if (!mountedRef.current) return;
+        if (!actionIsActive(mountedRef, signal)) return;
         nativeLayoutRef.current = restored;
         acceptCommittedLayout(restored);
       } catch (rollbackError) {
@@ -301,13 +339,14 @@ export function useWindowCluster(): UseWindowClusterReturn {
       }
       throw nativeError;
     }
-    if (!mountedRef.current) return;
+    if (!actionIsActive(mountedRef, signal)) return;
     nativeLayoutRef.current = saved;
     acceptCommittedLayout(saved);
   }, [acceptCommittedLayout, saveWithEcho]);
 
   const toggleSide = useCallback(async (side: WidgetSide) => {
-    await runAction(async () => {
+    await runAction(async (signal) => {
+      requireActiveAction(mountedRef, signal);
       const current = layoutRef.current;
       const committed = committedLayoutRef.current;
       if (!current || !committed) throw new Error("Window cluster layout is not loaded");
@@ -322,25 +361,30 @@ export function useWindowCluster(): UseWindowClusterReturn {
           side,
           visible: side === "left" ? restored.leftVisible : restored.rightVisible,
         }),
+        signal,
       );
     }, `Failed to toggle ${side} cluster windows`);
   }, [persistThenApply, runAction]);
 
   const openSettings = useCallback(async () => {
-    await runAction(async () => {
+    await runAction(async (signal) => {
+      requireActiveAction(mountedRef, signal);
       const settings = await Window.getByLabel("settings");
+      if (!actionIsActive(mountedRef, signal)) return;
       if (!settings) throw new Error("Settings window is unavailable");
       await settings.show();
+      if (!actionIsActive(mountedRef, signal)) return;
       await settings.setFocus();
     }, "Failed to open settings window");
   }, [runAction]);
 
   const enterEdit = useCallback(async () => {
-    await runAction(async () => {
+    await runAction(async (signal) => {
+      requireActiveAction(mountedRef, signal);
       const current = layoutRef.current;
       if (!current) throw new Error("Window cluster layout is not loaded");
       await invoke("set_cluster_edit_mode", { enabled: true });
-      if (!mountedRef.current) return;
+      if (!actionIsActive(mountedRef, signal)) return;
       const next = { ...current, editMode: true };
       nativeLayoutRef.current = next;
       acceptWorkingLayout(next);
@@ -348,7 +392,8 @@ export function useWindowCluster(): UseWindowClusterReturn {
   }, [acceptWorkingLayout, runAction]);
 
   const commitEdit = useCallback(async () => {
-    await runAction(async () => {
+    await runAction(async (signal) => {
+      requireActiveAction(mountedRef, signal);
       const current = layoutRef.current;
       const committed = committedLayoutRef.current;
       if (!current || !committed) throw new Error("Window cluster layout is not loaded");
@@ -358,24 +403,27 @@ export function useWindowCluster(): UseWindowClusterReturn {
         next,
         async (saved) => invoke("apply_widget_layout", { layout: saved }),
         async (restored) => invoke("apply_widget_layout", { layout: restored }),
+        signal,
       );
     }, "Failed to commit cluster layout");
   }, [persistThenApply, runAction]);
 
   const cancelEdit = useCallback(async () => {
-    await runAction(async () => {
+    await runAction(async (signal) => {
+      requireActiveAction(mountedRef, signal);
       const committed = committedLayoutRef.current;
       if (!committed) throw new Error("No committed window cluster layout is available");
       const restored = { ...committed, editMode: false };
       await invoke("apply_widget_layout", { layout: restored });
-      if (!mountedRef.current) return;
+      if (!actionIsActive(mountedRef, signal)) return;
       nativeLayoutRef.current = restored;
       acceptWorkingLayout(restored);
     }, "Failed to cancel cluster layout editing");
   }, [acceptWorkingLayout, runAction]);
 
   const hideWidget = useCallback(async (widgetId: WidgetWindowId) => {
-    await runAction(async () => {
+    await runAction(async (signal) => {
+      requireActiveAction(mountedRef, signal);
       const current = layoutRef.current;
       const committed = committedLayoutRef.current;
       if (!current || !committed) throw new Error("Window cluster layout is not loaded");
@@ -385,6 +433,7 @@ export function useWindowCluster(): UseWindowClusterReturn {
         next,
         async () => invoke("hide_widget_window", { widgetId }),
         async (restored) => invoke("apply_widget_layout", { layout: restored }),
+        signal,
       );
     }, `Failed to hide ${widgetId} widget`);
   }, [persistThenApply, runAction]);
@@ -401,4 +450,48 @@ export function useWindowCluster(): UseWindowClusterReturn {
     cancelEdit,
     hideWidget,
   };
+}
+
+export interface UseWidgetWindowActionsReturn {
+  hideWidget: (widgetId: WidgetWindowId) => Promise<void>;
+}
+
+export function useWidgetWindowActions(): UseWidgetWindowActionsReturn {
+  const mountedRef = useRef(false);
+  const operationQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const actionControllersRef = useRef(new Set<AbortController>());
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      for (const controller of actionControllersRef.current) controller.abort();
+      actionControllersRef.current.clear();
+    };
+  }, []);
+
+  const hideWidget = useCallback((widgetId: WidgetWindowId): Promise<void> => {
+    if (!mountedRef.current) return Promise.resolve();
+    const execute = async () => {
+      if (!mountedRef.current) return;
+      const controller = new AbortController();
+      actionControllersRef.current.add(controller);
+      try {
+        requireActiveAction(mountedRef, controller.signal);
+        const current = await loadLayout(controller.signal);
+        requireActiveAction(mountedRef, controller.signal);
+        await saveLayout(hidePlacement(current, widgetId), controller.signal);
+        requireActiveAction(mountedRef, controller.signal);
+      } catch {
+        // The optional root has no cluster state owner; the daemon/main root remain authoritative.
+      } finally {
+        actionControllersRef.current.delete(controller);
+      }
+    };
+    const result = operationQueueRef.current.then(execute, execute);
+    operationQueueRef.current = result.catch(() => undefined);
+    return result;
+  }, []);
+
+  return { hideWidget };
 }
