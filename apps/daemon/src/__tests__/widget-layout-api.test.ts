@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -65,6 +65,21 @@ describe("Widget layout API", () => {
 
     expect(response.status).toBe(400);
     expect(await response.json()).toMatchObject({ code: "invalid_widget_layout" });
+  });
+
+  it("preserves HTTP 500 for widget layout persistence failures", async () => {
+    vi.spyOn(store, "setWidgetLayout").mockImplementation(() => {
+      throw new Error("persistence failed");
+    });
+
+    const response = await server.getApp().request("/api/settings/widgets", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(DEFAULT_CLUSTER_LAYOUT),
+    });
+
+    expect(response.status).toBe(500);
+    expect(await response.text()).toBe("Internal Server Error");
   });
 
   it("rejects duplicate widget placements with a typed 400 error", async () => {
