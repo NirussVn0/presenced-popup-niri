@@ -4,6 +4,7 @@ import { IntegrationHealthSchema } from "./health.js";
 import { DesktopFactSchema, MediaFactSchema } from "./facts.js";
 import { ManualOverrideSchema } from "./rules.js";
 import { LyricsPayloadSchema } from "./lyrics.js";
+import { ClusterLayoutV1Schema } from "./widget-layout.js";
 
 export const DaemonEventSchema = z.discriminatedUnion("type", [
   z.object({
@@ -37,6 +38,10 @@ export const DaemonEventSchema = z.discriminatedUnion("type", [
   z.object({
     type: z.literal("lyrics.changed"),
     payload: LyricsPayloadSchema.nullable(),
+  }),
+  z.object({
+    type: z.literal("widget.layout.changed"),
+    payload: ClusterLayoutV1Schema,
   }),
 ]);
 export type DaemonEvent = z.infer<typeof DaemonEventSchema>;

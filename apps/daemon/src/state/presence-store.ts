@@ -142,6 +142,11 @@ export class PresenceStore extends EventEmitter {
 
   public setWidgetLayout(layout: ClusterLayoutV1): void {
     this.database?.setKv("widget-layout-v1", layout);
+    const event: DaemonEvent = {
+      type: "widget.layout.changed",
+      payload: layout,
+    };
+    this.emit("event", event);
   }
 
   public setHealth(health: IntegrationHealth): void {

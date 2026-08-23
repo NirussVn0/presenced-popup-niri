@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { WebSocket } from "ws";
 import { ClusterLayoutV1, DEFAULT_CLUSTER_LAYOUT } from "@presenced/contracts";
 import { ApiServer } from "../api/server.js";
 import { DatabaseManager } from "../state/database.js";
@@ -54,6 +55,36 @@ describe("Widget layout API", () => {
 
     expect(response.status).toBe(200);
     expect(await response.json()).toEqual(layout);
+  });
+
+  it("broadcasts persisted layout changes as daemon evidence", async () => {
+    const layout: ClusterLayoutV1 = {
+      ...DEFAULT_CLUSTER_LAYOUT,
+      rightVisible: true,
+      placements: [
+        { widgetId: "rvc", side: "right", order: 0, lane: "middle", size: "standard", visible: true },
+      ],
+    };
+    const ws = new WebSocket(`ws://127.0.0.1:${server.getPort()}/api/events`);
+    const receivedEvents: Array<{ type: string; payload: unknown }> = [];
+    ws.on("message", (data) => {
+      receivedEvents.push(JSON.parse(data.toString()) as { type: string; payload: unknown });
+    });
+    await new Promise<void>((resolve, reject) => {
+      ws.on("open", resolve);
+      ws.on("error", reject);
+    });
+
+    const response = await server.getApp().request("/api/settings/widgets", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(layout),
+    });
+    expect(response.status).toBe(200);
+    await new Promise((resolve) => setTimeout(resolve, 80));
+
+    expect(receivedEvents).toContainEqual({ type: "widget.layout.changed", payload: layout });
+    ws.close();
   });
 
   it("returns a typed 400 error for malformed JSON", async () => {
