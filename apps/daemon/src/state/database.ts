@@ -2,6 +2,7 @@ import { DatabaseSync } from "node:sqlite";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
+import { z } from "zod";
 import {
   PresenceRules,
   ManualOverride,
@@ -108,6 +109,33 @@ export class DatabaseManager {
       ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
     `);
     stmt.run("rules", JSON.stringify(rules), Date.now());
+  }
+
+  public getKv(key: string): string | undefined {
+    const row = this.db.prepare("SELECT value FROM kv_store WHERE key = ?").get(key) as
+      | { value: string }
+      | undefined;
+    return row?.value;
+  }
+
+  public getKvParsed<T>(key: string, schema: z.ZodType<T>): T | undefined {
+    try {
+      const value = this.getKv(key);
+      if (value === undefined) return undefined;
+      const parsed = schema.safeParse(JSON.parse(value));
+      return parsed.success ? parsed.data : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  public setKv(key: string, value: unknown): void {
+    const stmt = this.db.prepare(`
+      INSERT INTO kv_store (key, value, updated_at)
+      VALUES (?, ?, ?)
+      ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+    `);
+    stmt.run(key, JSON.stringify(value), Date.now());
   }
 
   public getPrivacyMode(): boolean {

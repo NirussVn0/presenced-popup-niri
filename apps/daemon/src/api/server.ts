@@ -11,6 +11,7 @@ import {
   ManualOverrideSchema,
   PresenceRulesSchema,
   DaemonEvent,
+  ClusterLayoutV1Schema,
 } from "@presenced/contracts";
 import { PresenceStore } from "../state/presence-store.js";
 import { PomodoroEngine } from "../sources/pomodoro/pomodoro-engine.js";
@@ -275,6 +276,20 @@ export class ApiServer {
     // Discord config endpoints
     this.app.get("/api/settings/discord", (c) => {
       return c.json(this.store.getDiscordConfig());
+    });
+
+    // Widget layout endpoints
+    this.app.get("/api/settings/widgets", (c) => {
+      return c.json(this.store.getWidgetLayout());
+    });
+
+    this.app.put("/api/settings/widgets", async (c) => {
+      const parsed = ClusterLayoutV1Schema.safeParse(await c.req.json());
+      if (!parsed.success) {
+        return c.json({ code: "invalid_widget_layout", issues: parsed.error.issues }, 400);
+      }
+      this.store.setWidgetLayout(parsed.data);
+      return c.json(parsed.data);
     });
 
     this.app.post("/api/settings/discord", async (c) => {

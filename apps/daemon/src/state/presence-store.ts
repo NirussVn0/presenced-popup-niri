@@ -15,6 +15,9 @@ import {
   IntegrationHealth,
   DaemonEvent,
   DEFAULT_PRIORITIES,
+  ClusterLayoutV1,
+  ClusterLayoutV1Schema,
+  DEFAULT_CLUSTER_LAYOUT,
 } from "@presenced/contracts";
 import { resolvePresence, ResolverResult, SceneResolver } from "@presenced/core";
 
@@ -131,6 +134,14 @@ export class PresenceStore extends EventEmitter {
 
   public setRvcConfig(config: { enabled: boolean; tickIntervalSec: number; entries: any[] }): void {
     this.database?.saveRvcConfig(config);
+  }
+
+  public getWidgetLayout(): ClusterLayoutV1 {
+    return this.database?.getKvParsed("widget-layout-v1", ClusterLayoutV1Schema) ?? DEFAULT_CLUSTER_LAYOUT;
+  }
+
+  public setWidgetLayout(layout: ClusterLayoutV1): void {
+    this.database?.setKv("widget-layout-v1", layout);
   }
 
   public setHealth(health: IntegrationHealth): void {
