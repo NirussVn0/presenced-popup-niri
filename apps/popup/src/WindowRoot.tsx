@@ -1,4 +1,4 @@
-import type { ComponentType } from "react";
+import type { ComponentType, ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { X } from "lucide-react";
@@ -19,58 +19,93 @@ function MainDashboard() {
   return <App />;
 }
 
+function OptionalDaemonContent({
+  snapshotAvailable,
+  error,
+  children,
+}: {
+  snapshotAvailable: boolean;
+  error: string | null;
+  children: ReactNode;
+}) {
+  if (snapshotAvailable) return children;
+  return (
+    <div
+      className="glass-surface flex h-full min-h-0 items-center justify-center rounded-niri p-3 text-center"
+      data-widget-state="unavailable"
+    >
+      <div>
+        <p className="text-xs font-semibold text-status-degraded">Daemon data unavailable</p>
+        <p className="mt-1 text-2xs text-text-muted">
+          {error ?? "Waiting for a validated daemon snapshot."}
+        </p>
+      </div>
+    </div>
+  );
+}
+
 function MusicWidgetWindow() {
-  const { snapshot, playPauseMedia, nextMedia, previousMedia } = usePresenceCompanion();
+  const { snapshot, error, playPauseMedia, nextMedia, previousMedia } = usePresenceCompanion();
   return (
     <WidgetWindowShell widgetId="music" title="Music">
-      <MusicWidget
-        media={snapshot?.media}
-        onPlayPause={playPauseMedia}
-        onNext={nextMedia}
-        onPrevious={previousMedia}
-      />
+      <OptionalDaemonContent snapshotAvailable={snapshot !== null} error={error}>
+        <MusicWidget
+          media={snapshot?.media}
+          onPlayPause={playPauseMedia}
+          onNext={nextMedia}
+          onPrevious={previousMedia}
+        />
+      </OptionalDaemonContent>
     </WidgetWindowShell>
   );
 }
 
 function RvcWidgetWindow() {
-  const { snapshot, wsConnected } = usePresenceCompanion();
+  const { snapshot, wsConnected, error } = usePresenceCompanion();
   const isMusicPlaying = snapshot?.media?.playback === "playing";
   return (
     <WidgetWindowShell widgetId="rvc" title="Discord RPC">
-      <RvcWidget
-        connected={wsConnected}
-        status={snapshot?.presence?.title ?? undefined}
-        clientId="15403406"
-        displayMode={isMusicPlaying ? "music" : "auto"}
-      />
+      <OptionalDaemonContent snapshotAvailable={snapshot !== null} error={error}>
+        <RvcWidget
+          connected={wsConnected}
+          status={snapshot?.presence?.title ?? undefined}
+          clientId="15403406"
+          displayMode={isMusicPlaying ? "music" : "auto"}
+        />
+      </OptionalDaemonContent>
     </WidgetWindowShell>
   );
 }
 
 function LyricsWidgetWindow() {
-  const { snapshot } = usePresenceCompanion();
+  const { snapshot, error } = usePresenceCompanion();
   return (
     <WidgetWindowShell widgetId="lyrics" title="Lyrics">
-      <LyricsWidget lyrics={snapshot?.lyrics} media={snapshot?.media} />
+      <OptionalDaemonContent snapshotAvailable={snapshot !== null} error={error}>
+        <LyricsWidget lyrics={snapshot?.lyrics} media={snapshot?.media} />
+      </OptionalDaemonContent>
     </WidgetWindowShell>
   );
 }
 
 function SystemWidgetWindow() {
-  const { snapshot } = usePresenceCompanion();
+  const { snapshot, error } = usePresenceCompanion();
   return (
     <WidgetWindowShell widgetId="system" title="System">
-      <SystemWidget system={snapshot?.system} />
+      <OptionalDaemonContent snapshotAvailable={snapshot !== null} error={error}>
+        <SystemWidget system={snapshot?.system} />
+      </OptionalDaemonContent>
     </WidgetWindowShell>
   );
 }
 
 function CountdownWidgetWindow() {
-  const { snapshot } = usePresenceCompanion();
+  const { snapshot, error } = usePresenceCompanion();
   return (
     <WidgetWindowShell widgetId="countdown" title="Countdown">
-      <CountdownWidget countdown={snapshot?.countdown} />
+      <OptionalDaemonContent snapshotAvailable={snapshot !== null} error={error}>
+        <CountdownWidget countdown={snapshot?.countdown} />
+      </OptionalDaemonContent>
     </WidgetWindowShell>
   );
 }
@@ -78,6 +113,7 @@ function CountdownWidgetWindow() {
 function PomodoroWidgetWindow() {
   const {
     snapshot,
+    error,
     startPomodoro,
     pausePomodoro,
     resumePomodoro,
@@ -86,14 +122,16 @@ function PomodoroWidgetWindow() {
   } = usePresenceCompanion();
   return (
     <WidgetWindowShell widgetId="pomodoro" title="Pomodoro">
-      <PomodoroWidget
-        pomodoro={snapshot?.pomodoro}
-        onStart={startPomodoro}
-        onPause={pausePomodoro}
-        onResume={resumePomodoro}
-        onStop={stopPomodoro}
-        onSkip={skipPomodoro}
-      />
+      <OptionalDaemonContent snapshotAvailable={snapshot !== null} error={error}>
+        <PomodoroWidget
+          pomodoro={snapshot?.pomodoro}
+          onStart={startPomodoro}
+          onPause={pausePomodoro}
+          onResume={resumePomodoro}
+          onStop={stopPomodoro}
+          onSkip={skipPomodoro}
+        />
+      </OptionalDaemonContent>
     </WidgetWindowShell>
   );
 }

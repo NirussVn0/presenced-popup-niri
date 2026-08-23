@@ -129,3 +129,62 @@ The required unfiltered `pnpm run test` was also run. It produced **157 passed, 
 - Layout-stream disconnect is visible and non-polling but does not automatically reconnect in this slice.
 - The repository-wide full test command remains red only on the confirmed base-stale Task 4 source-location assertion described above.
 - No raw titles, credentials, tokens, secrets, or new noisy debug logging were introduced.
+
+## Important review fix round (2026-08-23)
+
+This section supersedes the earlier review concerns and stale full-suite ruling above.
+
+### Fixes delivered
+
+- All optional runtime roots now require real companion snapshot evidence before rendering widget content. Without evidence they render a bounded `data-widget-state="unavailable"` state with the companion error (or an explicit wait-for-validated-snapshot message), so Countdown and Pomodoro cannot present fabricated `Imminent`/zero-day or actionable `25:00` state.
+- `WidgetWindowShell` now routes close through `useWindowCluster().hideWidget`. Hide and side visibility persist the canonical daemon layout before native mutation; native failures persist and apply the previous layout as rollback, while successful writes consume their own `widget.layout.changed` echo instead of applying geometry twice.
+- Toggle, hide, enter-edit, commit, cancel, daemon-event apply, and their error paths share one promise queue. Commit is persist-then-apply with rollback; cancel updates React state only after native restoration succeeds; `<`/`>` continue to call Rust `set_cluster_visibility`.
+- Startup now constructs and opens the event subscription before issuing GET, buffers the latest schema-validated layout event across GET and native initialization, catches events that arrive during initialization with a final ordered apply, and remains loading until socket-open plus native initialization evidence exists.
+- Startup GET uses `AbortController`; cleanup marks the hook inactive before closing/aborting, and every post-await native/state transition checks mounted/active state so cleanup cannot initialize or mutate after unmount.
+- The Niri integration assertion now inspects `lib.rs` module/handler/setup wiring and current `window_cluster.rs` symbols (`find_niri_windows`, `center_main_window_on_niri`, and `center-window`).
+- The daemon WebSocket test now awaits the actual layout frame and socket close instead of sleeping for 80 ms.
+
+### Behavioral regression evidence
+
+New mounted hook/component coverage exercises:
+
+- subscribe-before-fetch startup, loading truth, stale GET versus buffered event, and an even newer event arriving during native initialization;
+- valid versus malformed layout frames, exactly-once external apply, degraded disconnect, abort signal propagation, socket cleanup, and no post-unmount initialization;
+- persist-before-native toggle/hide ordering, serialized edit enter/commit/cancel, PUT failure with no native mutation, native visibility failure with persisted/native rollback, and self-echo consumption without duplicate `apply_widget_layout`;
+- `WidgetWindowShell` close delegation to `hideWidget` and Countdown/Pomodoro unavailable rendering without snapshot evidence.
+
+TDD RED evidence before production fixes:
+
+```text
+focused review suite: 11 failed, 25 passed
+- Countdown/Pomodoro lacked data-widget-state="unavailable" and rendered Imminent/25:00-like real state.
+- WidgetWindowShell invoked hide_widget_window directly; hideWidget spy was never called.
+- Startup created no WebSocket before GET.
+- toggle/hide invoked native before pending/failed PUT.
+- enter/commit/cancel ran concurrently.
+- native toggle failure had no daemon/native rollback.
+```
+
+### Final verification evidence
+
+```text
+pnpm exec vitest run apps/popup/src/__tests__/use-window-cluster.test.tsx apps/popup/src/__tests__/widget-window-shell.test.tsx apps/popup/src/__tests__/window-root.test.tsx apps/popup/src/__tests__/niri-popup-config.test.ts apps/daemon/src/__tests__/widget-layout-api.test.ts
+PASS — 5 files, 36 tests
+
+pnpm run typecheck
+PASS — contracts, core, daemon, popup, web
+
+pnpm run test
+PASS — unfiltered 47 files, 170 tests
+
+pnpm run lint
+PASS
+
+pnpm run build
+PASS — contracts/core TypeScript, daemon tsup, web Vite (1634 modules), popup Vite (2056 modules)
+
+git diff --check
+PASS
+```
+
+Generated `tsconfig.tsbuildinfo` changes were restored after gates; no generated build artifacts are included in the scoped diff. No live Tauri/Niri GUI smoke test was run; native behavior remains covered by the reviewed Task 4 Rust implementation plus the behavioral bridge tests above.

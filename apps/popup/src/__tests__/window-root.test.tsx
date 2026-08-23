@@ -3,6 +3,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 let currentLabel = "widget-main";
+let companionError: string | null = "daemon connection refused";
 
 vi.mock("@tauri-apps/api/window", () => ({
   getCurrentWindow: () => ({ label: currentLabel }),
@@ -17,6 +18,7 @@ vi.mock("../hooks/usePresenceCompanion.js", () => ({
   usePresenceCompanion: () => ({
     snapshot: null,
     wsConnected: false,
+    error: companionError,
     playPauseMedia: vi.fn(),
     nextMedia: vi.fn(),
     previousMedia: vi.fn(),
@@ -47,6 +49,7 @@ const renderWindow = (label: string) => {
 describe("WindowRoot", () => {
   beforeEach(() => {
     currentLabel = "widget-main";
+    companionError = "daemon connection refused";
   });
 
   it("dispatches widget-main to the compact dashboard", () => {
@@ -98,6 +101,19 @@ describe("WindowRoot", () => {
     expect(html).toContain('aria-label="Close settings"');
     expect(html).not.toContain('data-window-content="dashboard"');
   });
+
+  it.each(["widget-countdown", "widget-pomodoro"])(
+    "renders truthful daemon-unavailable content for %s without snapshot evidence",
+    (label) => {
+      const html = renderWindow(label);
+
+      expect(html).toContain('data-widget-state="unavailable"');
+      expect(html).toContain("Daemon data unavailable");
+      expect(html).toContain("daemon connection refused");
+      expect(html).not.toContain("25:00");
+      expect(html).not.toContain("Imminent");
+    },
+  );
 });
 
 describe("window cluster layout transitions", () => {

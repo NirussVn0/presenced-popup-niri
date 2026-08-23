@@ -66,9 +66,12 @@ describe("Widget layout API", () => {
       ],
     };
     const ws = new WebSocket(`ws://127.0.0.1:${server.getPort()}/api/events`);
-    const receivedEvents: Array<{ type: string; payload: unknown }> = [];
-    ws.on("message", (data) => {
-      receivedEvents.push(JSON.parse(data.toString()) as { type: string; payload: unknown });
+    const layoutEvent = new Promise<{ type: string; payload: unknown }>((resolve, reject) => {
+      ws.on("message", (data) => {
+        const event = JSON.parse(data.toString()) as { type: string; payload: unknown };
+        if (event.type === "widget.layout.changed") resolve(event);
+      });
+      ws.on("error", reject);
     });
     await new Promise<void>((resolve, reject) => {
       ws.on("open", resolve);
@@ -81,10 +84,11 @@ describe("Widget layout API", () => {
       body: JSON.stringify(layout),
     });
     expect(response.status).toBe(200);
-    await new Promise((resolve) => setTimeout(resolve, 80));
 
-    expect(receivedEvents).toContainEqual({ type: "widget.layout.changed", payload: layout });
+    await expect(layoutEvent).resolves.toEqual({ type: "widget.layout.changed", payload: layout });
+    const closed = new Promise<void>((resolve) => ws.once("close", () => resolve()));
     ws.close();
+    await closed;
   });
 
   it("returns a typed 400 error for malformed JSON", async () => {

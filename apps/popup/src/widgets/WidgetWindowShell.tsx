@@ -1,7 +1,7 @@
 import type { ReactNode } from "react";
 import type { WidgetWindowId } from "@presenced/contracts";
-import { invoke } from "@tauri-apps/api/core";
 import { X } from "lucide-react";
+import { useWindowCluster } from "../hooks/useWindowCluster.js";
 
 interface WidgetWindowShellProps {
   widgetId: WidgetWindowId;
@@ -10,10 +10,9 @@ interface WidgetWindowShellProps {
 }
 
 export function WidgetWindowShell({ widgetId, title, children }: WidgetWindowShellProps) {
+  const { hideWidget } = useWindowCluster();
   const hide = () => {
-    void invoke("hide_widget_window", { widgetId }).catch((error: unknown) => {
-      console.error("[presenced-popup] hide_widget_window failed", error);
-    });
+    void hideWidget(widgetId);
   };
 
   return (
