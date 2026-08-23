@@ -284,12 +284,16 @@ export class ApiServer {
     });
 
     this.app.put("/api/settings/widgets", async (c) => {
-      const parsed = ClusterLayoutV1Schema.safeParse(await c.req.json());
-      if (!parsed.success) {
-        return c.json({ code: "invalid_widget_layout", issues: parsed.error.issues }, 400);
+      try {
+        const parsed = ClusterLayoutV1Schema.safeParse(await c.req.json());
+        if (!parsed.success) {
+          return c.json({ code: "invalid_widget_layout", issues: parsed.error.issues }, 400);
+        }
+        this.store.setWidgetLayout(parsed.data);
+        return c.json(parsed.data);
+      } catch {
+        return c.json({ code: "invalid_widget_layout", issues: [] }, 400);
       }
-      this.store.setWidgetLayout(parsed.data);
-      return c.json(parsed.data);
     });
 
     this.app.post("/api/settings/discord", async (c) => {

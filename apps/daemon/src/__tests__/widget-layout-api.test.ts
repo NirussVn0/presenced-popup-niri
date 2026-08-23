@@ -56,6 +56,17 @@ describe("Widget layout API", () => {
     expect(await response.json()).toEqual(layout);
   });
 
+  it("returns a typed 400 error for malformed JSON", async () => {
+    const response = await server.getApp().request("/api/settings/widgets", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: "{",
+    });
+
+    expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({ code: "invalid_widget_layout" });
+  });
+
   it("rejects duplicate widget placements with a typed 400 error", async () => {
     const response = await server.getApp().request("/api/settings/widgets", {
       method: "PUT",
