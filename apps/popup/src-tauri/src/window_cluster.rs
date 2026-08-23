@@ -1,13 +1,19 @@
 use std::{
     collections::{HashMap, HashSet},
     str::FromStr,
-    sync::Mutex,
+    sync::Mutex as StdMutex,
 };
 
 #[cfg(target_os = "linux")]
-use std::{process::Command, thread, time::Duration};
+use std::{
+    io::Read,
+    process::{Child, Command, ExitStatus, Stdio},
+    thread,
+    time::{Duration, Instant},
+};
 
 use serde::Deserialize;
+use tauri::async_runtime::Mutex as AsyncMutex;
 use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder, WindowEvent};
 
 const CLUSTER_GAP: i32 = 10;
@@ -21,6 +27,10 @@ const DISCOVERY_DELAY: Duration = Duration::from_millis(50);
 const OPENING_SETTLE_DELAY: Duration = Duration::from_millis(1000);
 #[cfg(target_os = "linux")]
 const CENTER_RETRY_DELAY: Duration = Duration::from_millis(500);
+#[cfg(target_os = "linux")]
+const NIRI_EXEC_TIMEOUT: Duration = Duration::from_millis(1500);
+#[cfg(target_os = "linux")]
+const PROCESS_POLL_DELAY: Duration = Duration::from_millis(5);
 #[cfg(target_os = "linux")]
 const NIRI_EXHAUSTED: &str = "presenced-popup: Niri window operation exhausted retries";
 
@@ -115,6 +125,28 @@ impl WindowLabel {
             .iter()
             .find(|spec| spec.label.title() == title)
             .map(|spec| spec.label)
+    }
+
+    fn from_label(label: &str) -> Option<Self> {
+        WINDOW_REGISTRY
+            .iter()
+            .find(|spec| spec.label.label() == label)
+            .map(|spec| spec.label)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CloseDisposition {
+    ExitCluster,
+    Hide,
+    HideAndFocusMain,
+}
+
+fn close_disposition(label: WindowLabel) -> CloseDisposition {
+    match label {
+        WindowLabel::Main => CloseDisposition::ExitCluster,
+        WindowLabel::Widget(_) => CloseDisposition::Hide,
+        WindowLabel::Settings => CloseDisposition::HideAndFocusMain,
     }
 }
 
@@ -362,7 +394,59 @@ struct ProjectedWindow {
     rect: Rect,
 }
 
-fn project_layout(layout: &ValidatedClusterLayout, main: Rect) -> Vec<ProjectedWindow> {
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ProjectedLayout {
+    windows: Vec<ProjectedWindow>,
+    overflow_widget_ids: Vec<WidgetId>,
+}
+
+fn visible_projected_widget_ids(projection: &ProjectedLayout) -> HashSet<WidgetId> {
+    let overflow: HashSet<WidgetId> = projection.overflow_widget_ids.iter().copied().collect();
+    projection
+        .windows
+        .iter()
+        .filter(|projected| !overflow.contains(&projected.widget_id))
+        .map(|projected| projected.widget_id)
+        .collect()
+}
+
+fn overlaps(left: Rect, right: Rect) -> bool {
+    let left_right = i64::from(left.x) + i64::from(left.width);
+    let right_right = i64::from(right.x) + i64::from(right.width);
+    let left_bottom = i64::from(left.y) + i64::from(left.height);
+    let right_bottom = i64::from(right.y) + i64::from(right.height);
+    i64::from(left.x) < right_right
+        && left_right > i64::from(right.x)
+        && i64::from(left.y) < right_bottom
+        && left_bottom > i64::from(right.y)
+}
+
+fn clamp_rect(rect: Rect, output: Rect) -> Rect {
+    let width = rect.width.min(output.width);
+    let height = rect.height.min(output.height);
+    let minimum_x = i64::from(output.x);
+    let minimum_y = i64::from(output.y);
+    let maximum_x = minimum_x + i64::from(output.width) - i64::from(width);
+    let maximum_y = minimum_y + i64::from(output.height) - i64::from(height);
+    Rect {
+        x: i32::try_from(i64::from(rect.x).clamp(minimum_x, maximum_x))
+            .expect("clamped x remains in output i32 bounds"),
+        y: i32::try_from(i64::from(rect.y).clamp(minimum_y, maximum_y))
+            .expect("clamped y remains in output i32 bounds"),
+        width,
+        height,
+    }
+}
+
+fn rect_outside(rect: Rect, output: Rect) -> bool {
+    i64::from(rect.x) < i64::from(output.x)
+        || i64::from(rect.y) < i64::from(output.y)
+        || i64::from(rect.x) + i64::from(rect.width) > i64::from(output.x) + i64::from(output.width)
+        || i64::from(rect.y) + i64::from(rect.height)
+            > i64::from(output.y) + i64::from(output.height)
+}
+
+fn project_layout(layout: &ValidatedClusterLayout, main: Rect, output: Rect) -> ProjectedLayout {
     let mut placements: Vec<&ValidatedPlacement> = layout
         .placements
         .iter()
@@ -376,7 +460,9 @@ fn project_layout(layout: &ValidatedClusterLayout, main: Rect) -> Vec<ProjectedW
 
     let mut left_width = 0_i32;
     let mut right_width = 0_i32;
-    let mut projected = Vec::with_capacity(placements.len());
+    let mut windows = Vec::with_capacity(placements.len());
+    let mut overflow_widget_ids = Vec::new();
+    let mut occupied = vec![main];
     for placement in placements {
         let (width, height) = placement.size.dimensions();
         let width_i32 = i32::try_from(width).expect("window widths fit in i32");
@@ -400,18 +486,31 @@ fn project_layout(layout: &ValidatedClusterLayout, main: Rect) -> Vec<ProjectedW
             Lane::Middle => main.y + (main_height - height_i32) / 2,
             Lane::Bottom => main.y + main_height - height_i32,
         };
-        projected.push(ProjectedWindow {
+        let desired = Rect {
+            x,
+            y,
+            width,
+            height,
+        };
+        let rect = clamp_rect(desired, output);
+        if rect_outside(desired, output)
+            || occupied
+                .iter()
+                .any(|occupied_rect| overlaps(rect, *occupied_rect))
+        {
+            overflow_widget_ids.push(placement.widget_id);
+        }
+        occupied.push(rect);
+        windows.push(ProjectedWindow {
             widget_id: placement.widget_id,
-            rect: Rect {
-                x,
-                y,
-                width,
-                height,
-            },
+            rect,
         });
     }
 
-    projected
+    ProjectedLayout {
+        windows,
+        overflow_widget_ids,
+    }
 }
 
 #[derive(Clone, Deserialize)]
@@ -452,29 +551,122 @@ fn find_niri_windows(payload: &[u8], pid: u32) -> Result<HashMap<String, u64>, S
     Ok(mapped)
 }
 
+#[derive(Default)]
+struct ApplyGenerationTracker {
+    latest: u64,
+    committed: u64,
+}
+
+impl ApplyGenerationTracker {
+    fn request(&mut self) -> u64 {
+        self.latest = self
+            .latest
+            .checked_add(1)
+            .expect("apply generation exhausted");
+        self.latest
+    }
+
+    fn is_latest(&self, generation: u64) -> bool {
+        self.latest == generation
+    }
+
+    fn commit(&mut self, generation: u64) -> bool {
+        if !self.is_latest(generation) {
+            return false;
+        }
+        self.committed = generation;
+        true
+    }
+
+    #[cfg(test)]
+    fn committed(&self) -> u64 {
+        self.committed
+    }
+}
+
+struct ControllerData {
+    generations: ApplyGenerationTracker,
+    layout: Option<ValidatedClusterLayout>,
+}
+
 pub(crate) struct WindowClusterController {
     app: AppHandle,
     pid: u32,
-    niri_ids: HashMap<String, u64>,
-    layout: Option<ValidatedClusterLayout>,
+    data: StdMutex<ControllerData>,
+    apply_lock: AsyncMutex<()>,
 }
 
 pub(crate) fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     let main = app
-        .get_webview_window("main")
+        .get_webview_window(WindowLabel::Main.label())
         .ok_or_else(|| tauri::Error::WindowNotFound)?;
     main.set_title(WindowLabel::Main.title())?;
     main.set_decorations(false)?;
     main.set_resizable(false)?;
+    let app_on_main_close = app.handle().clone();
+    main.on_window_event(move |event| {
+        if let WindowEvent::CloseRequested { api, .. } = event {
+            api.prevent_close();
+            let _ = handle_close_request(&app_on_main_close, WindowLabel::Main);
+        }
+    });
 
-    app.manage(Mutex::new(WindowClusterController {
+    app.manage(WindowClusterController {
         app: app.handle().clone(),
         pid: std::process::id(),
-        niri_ids: HashMap::new(),
-        layout: None,
-    }));
+        data: StdMutex::new(ControllerData {
+            generations: ApplyGenerationTracker::default(),
+            layout: None,
+        }),
+        apply_lock: AsyncMutex::new(()),
+    });
     center_main_window_on_niri(std::process::id());
     Ok(())
+}
+
+fn handle_close_request(app: &AppHandle, label: WindowLabel) -> Result<(), String> {
+    match close_disposition(label) {
+        CloseDisposition::ExitCluster => {
+            let mut first_error = None;
+            for spec in WINDOW_REGISTRY {
+                if let Some(window) = app.get_webview_window(spec.label.label()) {
+                    let result = window
+                        .destroy()
+                        .map_err(|error| format!("failed to close cluster window: {error}"));
+                    if first_error.is_none() {
+                        first_error = result.err();
+                    }
+                }
+            }
+            app.exit(0);
+            first_error.map_or(Ok(()), Err)
+        }
+        CloseDisposition::Hide => app
+            .get_webview_window(label.label())
+            .ok_or_else(|| "cluster window is missing".to_owned())?
+            .hide()
+            .map_err(|error| format!("failed to hide cluster window: {error}")),
+        CloseDisposition::HideAndFocusMain => {
+            app.get_webview_window(label.label())
+                .ok_or_else(|| "settings window is missing".to_owned())?
+                .hide()
+                .map_err(|error| format!("failed to hide settings window: {error}"))?;
+            let main = app
+                .get_webview_window(WindowLabel::Main.label())
+                .ok_or_else(|| "main window is missing".to_owned())?;
+            main.show()
+                .map_err(|error| format!("failed to show main window: {error}"))?;
+            main.set_focus()
+                .map_err(|error| format!("failed to focus main window: {error}"))
+        }
+    }
+}
+
+#[tauri::command]
+pub(crate) fn close_window(window: tauri::WebviewWindow) -> Result<(), String> {
+    let label = WindowLabel::from_label(window.label())
+        .ok_or_else(|| "unknown cluster window".to_owned())?;
+    handle_close_request(window.app_handle(), label)
 }
 
 fn build_hidden_windows(app: &AppHandle) -> Result<(), String> {
@@ -494,43 +686,64 @@ fn build_hidden_windows(app: &AppHandle) -> Result<(), String> {
             .visible(false)
             .build()
             .map_err(|error| format!("failed to build {label}: {error}"))?;
-        let window_to_hide = window.clone();
+        let app_on_close = app.clone();
+        let label_on_close = spec.label;
         window.on_window_event(move |event| {
             if let WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
-                let _ = window_to_hide.hide();
+                let _ = handle_close_request(&app_on_close, label_on_close);
             }
         });
     }
     Ok(())
 }
 
-fn sync_window_visibility(app: &AppHandle, layout: &ValidatedClusterLayout) -> Result<(), String> {
+fn set_optional_visibility(
+    app: &AppHandle,
+    visible_widget_ids: &HashSet<WidgetId>,
+) -> Result<(), String> {
     for spec in WINDOW_REGISTRY.iter().filter(|spec| spec.magnetic) {
         let WindowLabel::Widget(widget_id) = spec.label else {
             continue;
         };
-        let visible = layout.placements.iter().any(|placement| {
-            placement.widget_id == widget_id
-                && placement.visible
-                && placement.side.is_visible(layout)
-        });
         let window = app
             .get_webview_window(spec.label.label())
             .ok_or_else(|| format!("missing window: {}", spec.label.label()))?;
-        if visible {
+        if visible_widget_ids.contains(&widget_id) {
             window.show()
         } else {
             window.hide()
         }
-        .map_err(|error| {
-            format!(
-                "failed to update {} visibility: {error}",
-                spec.label.label()
-            )
-        })?;
+        .map_err(|error| format!("failed to update optional window visibility: {error}"))?;
     }
     Ok(())
+}
+
+fn hide_optional_windows(app: &AppHandle) -> Result<(), String> {
+    let mut first_error = None;
+    for spec in WINDOW_REGISTRY.iter().filter(|spec| spec.magnetic) {
+        let result = app
+            .get_webview_window(spec.label.label())
+            .ok_or_else(|| "optional window is missing".to_owned())
+            .and_then(|window| {
+                window
+                    .hide()
+                    .map_err(|error| format!("failed to hide optional window: {error}"))
+            });
+        if first_error.is_none() {
+            first_error = result.err();
+        }
+    }
+    first_error.map_or(Ok(()), Err)
+}
+
+fn requested_widget_ids(layout: &ValidatedClusterLayout) -> HashSet<WidgetId> {
+    layout
+        .placements
+        .iter()
+        .filter(|placement| placement.visible && placement.side.is_visible(layout))
+        .map(|placement| placement.widget_id)
+        .collect()
 }
 
 fn emit_edit_mode(app: &AppHandle, enabled: bool) -> Result<(), String> {
@@ -538,132 +751,202 @@ fn emit_edit_mode(app: &AppHandle, enabled: bool) -> Result<(), String> {
         .map_err(|error| format!("failed to emit edit mode: {error}"))
 }
 
-fn controller_values(
-    state: &State<'_, Mutex<WindowClusterController>>,
-) -> Result<(AppHandle, u32), String> {
-    let controller = state
-        .lock()
-        .map_err(|_| "window cluster state is unavailable".to_owned())?;
-    Ok((controller.app.clone(), controller.pid))
+fn current_output_rect(app: &AppHandle) -> Result<Rect, String> {
+    let main = app
+        .get_webview_window(WindowLabel::Main.label())
+        .ok_or_else(|| "main window is missing".to_owned())?;
+    let monitor = main
+        .current_monitor()
+        .map_err(|error| format!("failed to read main output: {error}"))?
+        .ok_or_else(|| "main output is unavailable".to_owned())?;
+    let scale = monitor.scale_factor();
+    if !scale.is_finite() || scale <= 0.0 {
+        return Err("main output scale is invalid".to_owned());
+    }
+    let size = monitor.size();
+    let width = (f64::from(size.width) / scale).round() as u32;
+    let height = (f64::from(size.height) / scale).round() as u32;
+    if width == 0 || height == 0 {
+        return Err("main output has no usable bounds".to_owned());
+    }
+    Ok(Rect {
+        x: 0,
+        y: 0,
+        width,
+        height,
+    })
 }
 
-fn store_layout(
-    state: &State<'_, Mutex<WindowClusterController>>,
-    layout: ValidatedClusterLayout,
-) -> Result<(), String> {
-    state
-        .lock()
-        .map_err(|_| "window cluster state is unavailable".to_owned())?
-        .layout = Some(layout);
-    Ok(())
+#[derive(Clone, Debug)]
+struct AppliedNiriLayout {
+    visible_widget_ids: HashSet<WidgetId>,
 }
 
-fn store_niri_ids(
-    state: &State<'_, Mutex<WindowClusterController>>,
-    niri_ids: HashMap<String, u64>,
-) -> Result<(), String> {
-    state
+fn committed_visibility(result: &Result<AppliedNiriLayout, String>) -> HashSet<WidgetId> {
+    result
+        .as_ref()
+        .map(|applied| applied.visible_widget_ids.clone())
+        .unwrap_or_default()
+}
+
+fn generation_is_latest(
+    controller: &WindowClusterController,
+    generation: u64,
+) -> Result<bool, String> {
+    Ok(controller
+        .data
         .lock()
         .map_err(|_| "window cluster state is unavailable".to_owned())?
-        .niri_ids = niri_ids;
-    Ok(())
+        .generations
+        .is_latest(generation))
 }
 
 async fn apply_validated_layout(
-    state: State<'_, Mutex<WindowClusterController>>,
+    state: State<'_, WindowClusterController>,
     layout: ValidatedClusterLayout,
-    initialize: bool,
+    generation: u64,
 ) -> Result<(), String> {
-    let (app, pid) = controller_values(&state)?;
-    if initialize {
-        build_hidden_windows(&app)?;
+    let _apply_guard = state.apply_lock.lock().await;
+    if !generation_is_latest(&state, generation)? {
+        return Ok(());
     }
-    sync_window_visibility(&app, &layout)?;
-    emit_edit_mode(&app, layout.edit_mode)?;
-    store_layout(&state, layout.clone())?;
-    let niri_ids = reapply_niri_layout(pid, layout).await?;
-    store_niri_ids(&state, niri_ids)
+
+    let app = state.app.clone();
+    build_hidden_windows(&app)?;
+    hide_optional_windows(&app)?;
+    let output = current_output_rect(&app)?;
+    let staged_widget_ids = requested_widget_ids(&layout);
+    if let Err(error) = set_optional_visibility(&app, &staged_widget_ids) {
+        let _ = hide_optional_windows(&app);
+        return Err(error);
+    }
+
+    let result = reapply_niri_layout(state.pid, layout.clone(), output).await;
+    hide_optional_windows(&app)?;
+    let visible_widget_ids = committed_visibility(&result);
+    let applied = result?;
+
+    let mut data = state
+        .data
+        .lock()
+        .map_err(|_| "window cluster state is unavailable".to_owned())?;
+    if !data.generations.is_latest(generation) {
+        return Ok(());
+    }
+    if let Err(error) = emit_edit_mode(&app, layout.edit_mode) {
+        drop(data);
+        let _ = hide_optional_windows(&app);
+        return Err(error);
+    }
+    if let Err(error) = set_optional_visibility(&app, &visible_widget_ids) {
+        drop(data);
+        let _ = hide_optional_windows(&app);
+        return Err(error);
+    }
+    if !data.generations.commit(generation) {
+        drop(data);
+        let _ = hide_optional_windows(&app);
+        return Ok(());
+    }
+    debug_assert_eq!(applied.visible_widget_ids, visible_widget_ids);
+    data.layout = Some(layout);
+    Ok(())
 }
 
 #[tauri::command]
 pub(crate) async fn initialize_widget_windows(
-    state: State<'_, Mutex<WindowClusterController>>,
+    state: State<'_, WindowClusterController>,
     layout: ClusterLayoutV1Payload,
 ) -> Result<(), String> {
     let layout = validate_layout(layout)?;
-    apply_validated_layout(state, layout, true).await
+    let generation = state
+        .data
+        .lock()
+        .map_err(|_| "window cluster state is unavailable".to_owned())?
+        .generations
+        .request();
+    apply_validated_layout(state, layout, generation).await
 }
 
 #[tauri::command]
 pub(crate) async fn apply_widget_layout(
-    state: State<'_, Mutex<WindowClusterController>>,
+    state: State<'_, WindowClusterController>,
     layout: ClusterLayoutV1Payload,
 ) -> Result<(), String> {
     let layout = validate_layout(layout)?;
-    apply_validated_layout(state, layout, false).await
+    let generation = state
+        .data
+        .lock()
+        .map_err(|_| "window cluster state is unavailable".to_owned())?
+        .generations
+        .request();
+    apply_validated_layout(state, layout, generation).await
 }
 
 #[tauri::command]
 pub(crate) async fn set_cluster_visibility(
-    state: State<'_, Mutex<WindowClusterController>>,
+    state: State<'_, WindowClusterController>,
     side: String,
     visible: bool,
 ) -> Result<(), String> {
     let side = Side::from_str(&side)?;
-    let layout = {
-        let mut controller = state
+    let (layout, generation) = {
+        let mut data = state
+            .data
             .lock()
             .map_err(|_| "window cluster state is unavailable".to_owned())?;
-        let layout = controller
+        let mut layout = data
             .layout
-            .as_mut()
+            .clone()
             .ok_or_else(|| "window cluster is not initialized".to_owned())?;
         match side {
             Side::Left => layout.left_visible = visible,
             Side::Right => layout.right_visible = visible,
         }
-        layout.clone()
+        let generation = data.generations.request();
+        (layout, generation)
     };
-    apply_validated_layout(state, layout, false).await
+    apply_validated_layout(state, layout, generation).await
 }
 
 #[tauri::command]
-pub(crate) fn set_cluster_edit_mode(
-    state: State<'_, Mutex<WindowClusterController>>,
+pub(crate) async fn set_cluster_edit_mode(
+    state: State<'_, WindowClusterController>,
     enabled: bool,
 ) -> Result<(), String> {
-    let app = {
-        let mut controller = state
-            .lock()
-            .map_err(|_| "window cluster state is unavailable".to_owned())?;
-        let layout = controller
-            .layout
-            .as_mut()
-            .ok_or_else(|| "window cluster is not initialized".to_owned())?;
-        layout.edit_mode = enabled;
-        controller.app.clone()
-    };
-    emit_edit_mode(&app, enabled)
+    let _apply_guard = state.apply_lock.lock().await;
+    let mut data = state
+        .data
+        .lock()
+        .map_err(|_| "window cluster state is unavailable".to_owned())?;
+    let layout = data
+        .layout
+        .as_mut()
+        .ok_or_else(|| "window cluster is not initialized".to_owned())?;
+    emit_edit_mode(&state.app, enabled)?;
+    layout.edit_mode = enabled;
+    Ok(())
 }
 
 #[tauri::command]
 pub(crate) fn hide_widget_window(
-    state: State<'_, Mutex<WindowClusterController>>,
+    state: State<'_, WindowClusterController>,
     widget_id: String,
 ) -> Result<(), String> {
     let widget_id = WidgetId::from_str(&widget_id)?;
     let label = widget_id.window_label();
-    let mut controller = state
-        .lock()
-        .map_err(|_| "window cluster state is unavailable".to_owned())?;
-    let window = controller
+    let window = state
         .app
         .get_webview_window(label.label())
         .ok_or_else(|| format!("missing window: {}", label.label()))?;
     window
         .hide()
         .map_err(|error| format!("failed to hide {}: {error}", label.label()))?;
-    if let Some(layout) = controller.layout.as_mut() {
+    let mut data = state
+        .data
+        .lock()
+        .map_err(|_| "window cluster state is unavailable".to_owned())?;
+    if let Some(layout) = data.layout.as_mut() {
         if let Some(placement) = layout
             .placements
             .iter_mut()
@@ -672,8 +955,86 @@ pub(crate) fn hide_widget_window(
             placement.visible = false;
         }
     }
-    controller.niri_ids.remove(label.label());
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn wait_for_child_with_timeout(child: &mut Child, timeout: Duration) -> Result<ExitStatus, String> {
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) if started.elapsed() < timeout => thread::sleep(PROCESS_POLL_DELAY),
+            Ok(None) => {
+                let _ = child.kill();
+                child
+                    .wait()
+                    .map_err(|error| format!("failed to reap timed-out Niri command: {error}"))?;
+                return Err("Niri command timed out".to_owned());
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("failed while waiting for Niri command: {error}"));
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct NiriCommandOutput {
+    success: bool,
+    stdout: Vec<u8>,
+}
+
+#[cfg(target_os = "linux")]
+fn run_niri_command(arguments: &[&str]) -> Result<NiriCommandOutput, String> {
+    let mut child = Command::new("niri")
+        .args(arguments)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("could not start Niri command: {error}"))?;
+    let mut stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("Niri stdout was unavailable".to_owned());
+        }
+    };
+    let mut stderr = match child.stderr.take() {
+        Some(stderr) => stderr,
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("Niri stderr was unavailable".to_owned());
+        }
+    };
+    let stdout_reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stdout.read_to_end(&mut bytes).map(|_| bytes)
+    });
+    let stderr_reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stderr.read_to_end(&mut bytes).map(|_| bytes)
+    });
+
+    let status = wait_for_child_with_timeout(&mut child, NIRI_EXEC_TIMEOUT);
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| "Niri stdout reader failed".to_owned())?
+        .map_err(|error| format!("failed to read Niri stdout: {error}"))?;
+    stderr_reader
+        .join()
+        .map_err(|_| "Niri stderr reader failed".to_owned())?
+        .map_err(|error| format!("failed to read Niri stderr: {error}"))?;
+    let status = status?;
+
+    Ok(NiriCommandOutput {
+        success: status.success(),
+        stdout,
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -683,11 +1044,8 @@ fn discover_niri_windows(
 ) -> Result<(Vec<NiriWindow>, HashMap<String, u64>), String> {
     let mut last_error = "Niri windows were not available".to_owned();
     for attempt in 0..DISCOVERY_ATTEMPTS {
-        match Command::new("niri")
-            .args(["msg", "--json", "windows"])
-            .output()
-        {
-            Ok(output) if output.status.success() => match find_niri_windows(&output.stdout, pid) {
+        match run_niri_command(&["msg", "--json", "windows"]) {
+            Ok(output) if output.success => match find_niri_windows(&output.stdout, pid) {
                 Ok(mapped)
                     if required
                         .iter()
@@ -699,7 +1057,7 @@ fn discover_niri_windows(
                 Err(error) => last_error = error,
             },
             Ok(_) => last_error = "Niri windows command failed".to_owned(),
-            Err(error) => last_error = format!("could not start Niri windows command: {error}"),
+            Err(error) => last_error = error,
         }
         if attempt + 1 < DISCOVERY_ATTEMPTS {
             thread::sleep(DISCOVERY_DELAY);
@@ -710,11 +1068,8 @@ fn discover_niri_windows(
 
 #[cfg(target_os = "linux")]
 fn run_niri_action(arguments: &[&str]) -> Result<(), String> {
-    let output = Command::new("niri")
-        .args(arguments)
-        .output()
-        .map_err(|error| format!("could not start Niri action: {error}"))?;
-    if output.status.success() {
+    let output = run_niri_command(arguments)?;
+    if output.success {
         Ok(())
     } else {
         Err("Niri action failed".to_owned())
@@ -778,7 +1133,8 @@ fn main_rect(windows: &[NiriWindow], pid: u32) -> Result<Rect, String> {
 fn apply_niri_layout(
     pid: u32,
     layout: &ValidatedClusterLayout,
-) -> Result<HashMap<String, u64>, String> {
+    output: Rect,
+) -> Result<AppliedNiriLayout, String> {
     let mut required = vec![WindowLabel::Main];
     required.extend(
         layout
@@ -790,7 +1146,14 @@ fn apply_niri_layout(
     let (windows, mapped) = discover_niri_windows(pid, &required)?;
     let main = main_rect(&windows, pid)?;
 
-    for projected in project_layout(layout, main) {
+    let projection = project_layout(layout, main, output);
+    let visible_widget_ids = visible_projected_widget_ids(&projection);
+
+    for projected in projection
+        .windows
+        .into_iter()
+        .filter(|projected| visible_widget_ids.contains(&projected.widget_id))
+    {
         let label = projected.widget_id.window_label();
         let id = mapped
             .get(label.label())
@@ -815,16 +1178,17 @@ fn apply_niri_layout(
         ])?;
     }
 
-    Ok(mapped)
+    Ok(AppliedNiriLayout { visible_widget_ids })
 }
 
 #[cfg(target_os = "linux")]
 async fn reapply_niri_layout(
     pid: u32,
     layout: ValidatedClusterLayout,
-) -> Result<HashMap<String, u64>, String> {
+    output: Rect,
+) -> Result<AppliedNiriLayout, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let result = apply_niri_layout(pid, &layout);
+        let result = apply_niri_layout(pid, &layout, output);
         if result.is_err() {
             eprintln!("{NIRI_EXHAUSTED}: cluster layout");
         }
@@ -837,16 +1201,26 @@ async fn reapply_niri_layout(
 #[cfg(not(target_os = "linux"))]
 async fn reapply_niri_layout(
     _pid: u32,
-    _layout: ValidatedClusterLayout,
-) -> Result<HashMap<String, u64>, String> {
-    Ok(HashMap::new())
+    layout: ValidatedClusterLayout,
+    _output: Rect,
+) -> Result<AppliedNiriLayout, String> {
+    Ok(AppliedNiriLayout {
+        visible_widget_ids: requested_widget_ids(&layout),
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        find_niri_windows, project_layout, validate_layout, ClusterLayoutV1Payload, Lane, Rect,
-        Side, SizePreset, WidgetId, WidgetPlacementPayload, WindowLabel, WINDOW_REGISTRY,
+        close_disposition, committed_visibility, find_niri_windows, project_layout,
+        validate_layout, visible_projected_widget_ids, wait_for_child_with_timeout,
+        AppliedNiriLayout, ApplyGenerationTracker, CloseDisposition, ClusterLayoutV1Payload, Lane,
+        Rect, Side, SizePreset, WidgetId, WidgetPlacementPayload, WindowLabel, WINDOW_REGISTRY,
+    };
+    use std::{
+        collections::HashSet,
+        process::Command,
+        time::{Duration, Instant},
     };
 
     fn placement() -> WidgetPlacementPayload {
@@ -868,6 +1242,40 @@ mod tests {
             edit_mode: false,
             placements,
         }
+    }
+
+    #[test]
+    fn failed_apply_commits_no_optional_visibility() {
+        let failed: Result<AppliedNiriLayout, String> = Err("niri failed".to_owned());
+
+        assert!(committed_visibility(&failed).is_empty());
+    }
+
+    #[test]
+    fn stale_apply_generation_cannot_commit() {
+        let mut tracker = ApplyGenerationTracker::default();
+        let stale = tracker.request();
+        let latest = tracker.request();
+
+        assert!(!tracker.commit(stale));
+        assert!(tracker.commit(latest));
+        assert_eq!(tracker.committed(), latest);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn timed_out_child_is_killed_and_reaped() {
+        let mut child = Command::new("sh")
+            .args(["-c", "exec sleep 5"])
+            .spawn()
+            .unwrap();
+        let started = Instant::now();
+
+        let result = wait_for_child_with_timeout(&mut child, Duration::from_millis(50));
+
+        assert!(result.is_err());
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(child.try_wait().unwrap().is_some());
     }
 
     #[test]
@@ -959,21 +1367,131 @@ mod tests {
     }
 
     #[test]
-    fn registry_contains_every_hidden_window_and_settings_dimensions() {
-        assert_eq!(WINDOW_REGISTRY.len(), 9);
+    fn close_requests_follow_cluster_lifecycle_policy() {
         assert_eq!(
-            WINDOW_REGISTRY
-                .iter()
-                .filter(|spec| spec.create_hidden)
-                .count(),
-            8
+            close_disposition(WindowLabel::Main),
+            CloseDisposition::ExitCluster
         );
-        let settings = WINDOW_REGISTRY
+        assert_eq!(
+            close_disposition(WindowLabel::Widget(WidgetId::Music)),
+            CloseDisposition::Hide
+        );
+        assert_eq!(
+            close_disposition(WindowLabel::Settings),
+            CloseDisposition::HideAndFocusMain
+        );
+    }
+
+    #[test]
+    fn configured_main_matches_registry_and_has_no_resize_path() {
+        let config: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+        let configured = &config["app"]["windows"][0];
+
+        assert_eq!(configured["label"], WindowLabel::Main.label());
+        assert_eq!(configured["title"], WindowLabel::Main.title());
+        assert_eq!(configured["width"], 720);
+        assert_eq!(configured["height"], 420);
+        assert_eq!(configured["resizable"], false);
+        assert_eq!(configured["maximizable"], false);
+        assert!(!include_str!("lib.rs").contains("toggle_maximize"));
+    }
+
+    #[test]
+    fn registry_is_the_exact_unique_window_source_of_truth() {
+        let actual: Vec<_> = WINDOW_REGISTRY
             .iter()
-            .find(|spec| spec.label == WindowLabel::Settings)
-            .unwrap();
-        assert_eq!((settings.width, settings.height), (820, 680));
-        assert!(!settings.magnetic);
+            .map(|spec| {
+                (
+                    spec.label.label(),
+                    spec.label.title(),
+                    spec.width,
+                    spec.height,
+                    spec.create_hidden,
+                    spec.magnetic,
+                )
+            })
+            .collect();
+
+        assert_eq!(
+            actual,
+            vec![
+                (
+                    "widget-main",
+                    "presenced:widget-main",
+                    720,
+                    420,
+                    false,
+                    false
+                ),
+                (
+                    "widget-music",
+                    "presenced:widget-music",
+                    250,
+                    190,
+                    true,
+                    true
+                ),
+                ("widget-rvc", "presenced:widget-rvc", 250, 190, true, true),
+                (
+                    "widget-lyrics",
+                    "presenced:widget-lyrics",
+                    250,
+                    240,
+                    true,
+                    true
+                ),
+                (
+                    "widget-system",
+                    "presenced:widget-system",
+                    220,
+                    150,
+                    true,
+                    true
+                ),
+                (
+                    "widget-countdown",
+                    "presenced:widget-countdown",
+                    220,
+                    140,
+                    true,
+                    true
+                ),
+                (
+                    "widget-pomodoro",
+                    "presenced:widget-pomodoro",
+                    220,
+                    220,
+                    true,
+                    true
+                ),
+                (
+                    "widget-quote",
+                    "presenced:widget-quote",
+                    250,
+                    150,
+                    true,
+                    true
+                ),
+                ("settings", "presenced:settings", 820, 680, true, false),
+            ]
+        );
+        assert_eq!(
+            actual
+                .iter()
+                .map(|spec| spec.0)
+                .collect::<HashSet<_>>()
+                .len(),
+            actual.len()
+        );
+        assert_eq!(
+            actual
+                .iter()
+                .map(|spec| spec.1)
+                .collect::<HashSet<_>>()
+                .len(),
+            actual.len()
+        );
     }
 
     #[test]
@@ -991,11 +1509,21 @@ mod tests {
             height: 420,
         };
 
-        let projected = project_layout(&validated, main);
+        let projected = project_layout(
+            &validated,
+            main,
+            Rect {
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 1080,
+            },
+        );
 
-        assert_eq!(projected.len(), 2);
+        assert_eq!(projected.windows.len(), 2);
         assert_eq!(
             projected
+                .windows
                 .iter()
                 .find(|window| window.widget_id == WidgetId::Music)
                 .unwrap()
@@ -1009,6 +1537,7 @@ mod tests {
         );
         assert_eq!(
             projected
+                .windows
                 .iter()
                 .find(|window| window.widget_id == WidgetId::Lyrics)
                 .unwrap()
@@ -1018,6 +1547,52 @@ mod tests {
                 y: 510,
                 width: 250,
                 height: 240,
+            }
+        );
+    }
+
+    #[test]
+    fn marks_output_overflow_and_collisions_for_hiding() {
+        let mut music = placement();
+        music.size = "wide".to_owned();
+        let mut system = placement();
+        system.widget_id = "system".to_owned();
+        system.order = 1;
+        let validated = validate_layout(layout(vec![music, system])).unwrap();
+
+        let projected = project_layout(
+            &validated,
+            Rect {
+                x: 400,
+                y: 40,
+                width: 300,
+                height: 420,
+            },
+            Rect {
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+            },
+        );
+
+        assert_eq!(projected.overflow_widget_ids, vec![WidgetId::System]);
+        assert_eq!(
+            visible_projected_widget_ids(&projected),
+            HashSet::from([WidgetId::Music])
+        );
+        assert_eq!(
+            projected
+                .windows
+                .iter()
+                .find(|window| window.widget_id == WidgetId::System)
+                .unwrap()
+                .rect,
+            Rect {
+                x: 0,
+                y: 40,
+                width: 250,
+                height: 190,
             }
         );
     }

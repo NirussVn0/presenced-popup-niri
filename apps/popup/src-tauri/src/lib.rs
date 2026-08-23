@@ -6,20 +6,6 @@ fn minimize_window(window: tauri::WebviewWindow) {
 }
 
 #[tauri::command]
-fn toggle_maximize(window: tauri::WebviewWindow) {
-    if window.is_maximized().unwrap_or(false) {
-        let _ = window.unmaximize();
-    } else {
-        let _ = window.maximize();
-    }
-}
-
-#[tauri::command]
-fn close_window(window: tauri::WebviewWindow) {
-    let _ = window.close();
-}
-
-#[tauri::command]
 fn toggle_visibility(window: tauri::WebviewWindow) {
     if window.is_visible().unwrap_or(false) {
         let _ = window.hide();
@@ -35,8 +21,7 @@ pub fn run() {
         .plugin(tauri_plugin_shell::init())
         .invoke_handler(tauri::generate_handler![
             minimize_window,
-            toggle_maximize,
-            close_window,
+            window_cluster::close_window,
             toggle_visibility,
             window_cluster::initialize_widget_windows,
             window_cluster::set_cluster_visibility,
