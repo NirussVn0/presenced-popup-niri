@@ -1,57 +1,4 @@
-use tauri::Manager;
-
-#[cfg(target_os = "linux")]
-use std::{process::Command, thread, time::Duration};
-
-#[cfg(target_os = "linux")]
-fn find_niri_window_id(payload: &[u8], pid: u32) -> Option<u64> {
-    let windows = serde_json::from_slice::<Vec<serde_json::Value>>(payload).ok()?;
-    windows.into_iter().find_map(|window| {
-        let window_pid = window.get("pid")?.as_u64()?;
-        (window_pid == u64::from(pid))
-            .then(|| window.get("id")?.as_u64())
-            .flatten()
-    })
-}
-
-#[cfg(target_os = "linux")]
-fn center_window_on_niri() {
-    let pid = std::process::id();
-    thread::spawn(move || {
-        for _ in 0..40 {
-            if let Ok(output) = Command::new("niri")
-                .args(["msg", "--json", "windows"])
-                .output()
-            {
-                if output.status.success() {
-                    if let Some(window_id) = find_niri_window_id(&output.stdout, pid) {
-                        // Niri exposes the window before WebKit finishes its opening configure.
-                        // Let that settle, then re-center through the bounded opening-animation
-                        // window so late configures cannot win.
-                        thread::sleep(Duration::from_millis(1000));
-                        let window_id = window_id.to_string();
-                        let mut centered = false;
-                        for _ in 0..8 {
-                            centered |= Command::new("niri")
-                                .args(["msg", "action", "center-window", "--id", &window_id])
-                                .status()
-                                .is_ok_and(|status| status.success());
-                            thread::sleep(Duration::from_millis(500));
-                        }
-                        eprintln!(
-                            "presenced-popup: Niri startup placement for window {window_id}: {centered}"
-                        );
-                        return;
-                    }
-                }
-            }
-            thread::sleep(Duration::from_millis(50));
-        }
-    });
-}
-
-#[cfg(not(target_os = "linux"))]
-fn center_window_on_niri() {}
+mod window_cluster;
 
 #[tauri::command]
 fn minimize_window(window: tauri::WebviewWindow) {
@@ -91,34 +38,13 @@ pub fn run() {
             toggle_maximize,
             close_window,
             toggle_visibility,
+            window_cluster::initialize_widget_windows,
+            window_cluster::set_cluster_visibility,
+            window_cluster::apply_widget_layout,
+            window_cluster::set_cluster_edit_mode,
+            window_cluster::hide_widget_window,
         ])
-        .setup(|app| {
-            let window = app.get_webview_window("main").unwrap();
-            window.set_decorations(false)?;
-            center_window_on_niri();
-            Ok(())
-        })
+        .setup(window_cluster::setup)
         .run(tauri::generate_context!())
         .expect("error while running presenced-popup application");
-}
-
-#[cfg(all(test, target_os = "linux"))]
-mod tests {
-    use super::find_niri_window_id;
-
-    #[test]
-    fn finds_window_id_for_current_process() {
-        let payload = br#"[
-            {"id": 97, "pid": 1234, "app_id": "other"},
-            {"id": 98, "pid": 308745, "app_id": "presenced-popup-niri"}
-        ]"#;
-
-        assert_eq!(find_niri_window_id(payload, 308745), Some(98));
-        assert_eq!(find_niri_window_id(payload, 999999), None);
-    }
-
-    #[test]
-    fn ignores_invalid_niri_payloads() {
-        assert_eq!(find_niri_window_id(b"not-json", 308745), None);
-    }
 }
