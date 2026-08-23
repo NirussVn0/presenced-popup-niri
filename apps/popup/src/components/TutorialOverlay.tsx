@@ -1,35 +1,65 @@
-/**
- * TutorialOverlay — first-run tutorial with credit.
- * Shows on first launch, can be dismissed.
- */
-import { useState, useEffect } from "react";
-import { motion, AnimatePresence } from "framer-motion";
+/** First-run main-only tutorial with explicit optional-window selection. */
+import { useEffect, useState } from "react";
+import type { WidgetWindowId } from "@presenced/contracts";
+import { AnimatePresence, motion } from "framer-motion";
+import { Clock, MessageSquare, Music, Shield, Sparkles, X } from "lucide-react";
 import { springNiri } from "../lib/animations.js";
-import { X, Sparkles, Music, MessageSquare, Clock, Shield } from "lucide-react";
 
 const TUTORIAL_KEY = "presenced-tutorial-seen";
 
-export const TutorialOverlay = () => {
+const OPTIONAL_WINDOWS: {
+  id: WidgetWindowId;
+  label: string;
+  description: string;
+  icon: typeof Music;
+}[] = [
+  { id: "music", label: "Music Player", description: "Spinning vinyl + waveform", icon: Music },
+  { id: "rvc", label: "Discord RPC", description: "Live status sync", icon: MessageSquare },
+  { id: "lyrics", label: "Lyrics", description: "Current track lyrics", icon: Music },
+  { id: "system", label: "System", description: "Host status", icon: Shield },
+  { id: "countdown", label: "Countdown", description: "Upcoming dates", icon: Clock },
+  { id: "pomodoro", label: "Pomodoro", description: "Focus timer", icon: Clock },
+  { id: "quote", label: "Quote", description: "A quiet prompt", icon: Sparkles },
+];
+
+export interface TutorialOverlayProps {
+  onFinish: (selected: WidgetWindowId[]) => Promise<void>;
+  onSkip: () => Promise<void>;
+  disabled?: boolean;
+}
+
+export const TutorialOverlay = ({ onFinish, onSkip, disabled = false }: TutorialOverlayProps) => {
   const [show, setShow] = useState(false);
+  const [selected, setSelected] = useState<WidgetWindowId[]>([]);
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
 
   useEffect(() => {
-    const seen = localStorage.getItem(TUTORIAL_KEY);
-    if (!seen) setShow(true);
+    if (!localStorage.getItem(TUTORIAL_KEY)) setShow(true);
   }, []);
 
-  const dismiss = () => {
-    localStorage.setItem(TUTORIAL_KEY, "true");
-    setShow(false);
+  const complete = async (action: () => Promise<void>) => {
+    if (saving || disabled) return;
+    setSaving(true);
+    setSaveError(null);
+    try {
+      await action();
+      localStorage.setItem(TUTORIAL_KEY, "true");
+      setShow(false);
+    } catch (error) {
+      setSaveError(error instanceof Error ? error.message : "Could not save the first-run layout");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const toggle = (widgetId: WidgetWindowId, checked: boolean) => {
+    setSelected((current) => checked
+      ? [...current.filter((id) => id !== widgetId), widgetId]
+      : current.filter((id) => id !== widgetId));
   };
 
   if (!show) return null;
-
-  const features = [
-    { icon: Music, label: "Music Player", desc: "Spinning vinyl + waveform" },
-    { icon: MessageSquare, label: "Discord RPC", desc: "Live status sync" },
-    { icon: Clock, label: "Pomodoro", desc: "Focus timer" },
-    { icon: Shield, label: "Privacy", desc: "Mask sensitive data" },
-  ];
 
   return (
     <AnimatePresence>
@@ -41,68 +71,73 @@ export const TutorialOverlay = () => {
           exit={{ opacity: 0 }}
           transition={{ duration: 0.3 }}
         >
-          {/* Backdrop */}
-          <div className="absolute inset-0 bg-black/60 backdrop-blur-sm" onClick={dismiss} />
-
-          {/* Card */}
+          <div className="absolute inset-0 bg-black/60 backdrop-blur-sm" />
           <motion.div
-            className="relative z-10 glass-strong rounded-niri-xl p-6 max-w-sm w-full mx-4 space-y-4"
+            className="glass-strong relative z-10 mx-4 max-h-[90vh] w-full max-w-md space-y-4 overflow-y-auto rounded-niri-xl p-6"
             initial={{ scale: 0.9, y: 20 }}
             animate={{ scale: 1, y: 0 }}
             exit={{ scale: 0.9, y: 20 }}
             transition={springNiri}
           >
-            {/* Close button */}
             <button
               type="button"
-              onClick={dismiss}
-              className="absolute top-3 right-3 p-1 rounded-niri glass-surface text-text-secondary hover:text-text-primary transition-colors"
+              aria-label="Close tutorial and keep optional windows hidden"
+              onClick={() => void complete(onSkip)}
+              disabled={saving || disabled}
+              className="glass-surface absolute right-3 top-3 rounded-niri p-1 text-text-secondary hover:text-text-primary disabled:opacity-40"
             >
-              <X className="w-4 h-4" />
+              <X className="h-4 w-4" />
             </button>
 
-            {/* Header */}
-            <div className="text-center space-y-2">
-              <motion.div
-                className="w-12 h-12 mx-auto rounded-full bg-gradient-to-br from-accent-primary to-scene-music-from flex items-center justify-center"
-                animate={{ rotate: [0, 5, -5, 0] }}
-                transition={{ duration: 2, repeat: Infinity }}
-              >
-                <Sparkles className="w-6 h-6 text-white" />
-              </motion.div>
+            <div className="space-y-2 text-center">
+              <div className="mx-auto flex h-12 w-12 items-center justify-center rounded-full bg-gradient-to-br from-accent-primary to-scene-music-from">
+                <Sparkles className="h-6 w-6 text-white" />
+              </div>
               <h2 className="text-lg font-bold text-text-primary">Welcome to presenced</h2>
               <p className="text-xs text-text-secondary">
-                Niri Wayland × Discord Sync Companion
+                Start main-only. Select optional magnetic windows explicitly.
               </p>
             </div>
 
-            {/* Features */}
             <div className="grid grid-cols-2 gap-2">
-              {features.map((f) => {
-                const Icon = f.icon;
-                return (
-                  <div key={f.label} className="p-2.5 rounded-niri glass-surface text-center space-y-1">
-                    <Icon className="w-4 h-4 mx-auto text-accent-primary" />
-                    <div className="text-2xs font-bold text-text-primary">{f.label}</div>
-                    <div className="text-2xs text-text-muted">{f.desc}</div>
-                  </div>
-                );
-              })}
+              {OPTIONAL_WINDOWS.map(({ id, label, description, icon: Icon }) => (
+                <label key={id} className="glass-surface flex cursor-pointer items-start gap-2 rounded-niri p-2.5">
+                  <input
+                    type="checkbox"
+                    aria-label={`Show ${label} window`}
+                    checked={selected.includes(id)}
+                    disabled={saving || disabled}
+                    onChange={(event) => toggle(id, event.target.checked)}
+                  />
+                  <span>
+                    <Icon className="mb-1 h-4 w-4 text-accent-primary" />
+                    <span className="block text-2xs font-bold text-text-primary">{label}</span>
+                    <span className="block text-2xs text-text-muted">{description}</span>
+                  </span>
+                </label>
+              ))}
             </div>
 
-            {/* CTA */}
+            {saveError && <div role="alert" className="text-center text-2xs text-status-error">{saveError}</div>}
+
             <button
               type="button"
-              onClick={dismiss}
-              className="w-full py-2 rounded-niri bg-accent-primary hover:bg-accent-glow text-white font-bold text-sm transition-colors"
+              aria-label="Finish tutorial"
+              disabled={saving || disabled}
+              onClick={() => void complete(() => onFinish(selected))}
+              className="w-full rounded-niri bg-accent-primary py-2 text-sm font-bold text-white hover:bg-accent-glow disabled:opacity-40"
             >
-              Get Started
+              {saving ? "Saving…" : selected.length === 0 ? "Continue main-only" : "Save selected windows"}
             </button>
-
-            {/* Credit */}
-            <div className="text-center text-2xs text-text-ghost">
-              Built by NirussVn0 · presenced v0.5.0
-            </div>
+            <button
+              type="button"
+              aria-label="Skip optional windows"
+              disabled={saving || disabled}
+              onClick={() => void complete(onSkip)}
+              className="w-full text-2xs text-text-muted hover:text-text-primary disabled:opacity-40"
+            >
+              Skip — keep every optional window hidden
+            </button>
           </motion.div>
         </motion.div>
       )}

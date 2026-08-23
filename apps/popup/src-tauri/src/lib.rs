@@ -28,6 +28,8 @@ pub fn run() {
             window_cluster::apply_widget_layout,
             window_cluster::set_cluster_edit_mode,
             window_cluster::hide_widget_window,
+            window_cluster::complete_widget_drag,
+            window_cluster::get_cluster_geometry,
         ])
         .setup(window_cluster::setup)
         .run(tauri::generate_context!())

@@ -18,12 +18,17 @@ const { act, create } = createRequire(import.meta.url)(
 const tauri = vi.hoisted(() => ({
   invoke: vi.fn(),
   getByLabel: vi.fn(),
+  getCurrentWindow: vi.fn(),
+  emit: vi.fn(),
+  listen: vi.fn(),
 }));
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: tauri.invoke }));
 vi.mock("@tauri-apps/api/window", () => ({
   Window: { getByLabel: tauri.getByLabel },
+  getCurrentWindow: tauri.getCurrentWindow,
 }));
+vi.mock("@tauri-apps/api/event", () => ({ emit: tauri.emit, listen: tauri.listen }));
 
 import {
   useWindowCluster,
@@ -43,6 +48,11 @@ const INITIAL_LAYOUT: ClusterLayoutV1 = {
       visible: true,
     },
   ],
+};
+
+const CLUSTER_GEOMETRY = {
+  main: { x: 600, y: 330, width: 720, height: 420 },
+  output: { x: 0, y: 0, width: 1920, height: 1080 },
 };
 
 class ControlledWebSocket {
@@ -151,8 +161,13 @@ beforeEach(() => {
   renderer = null;
   extraRenderers = [];
   latest = undefined as unknown as UseWindowClusterReturn;
-  tauri.invoke.mockReset().mockResolvedValue(undefined);
+  tauri.invoke.mockReset().mockImplementation((command: string) =>
+    command === "get_cluster_geometry" ? Promise.resolve(CLUSTER_GEOMETRY) : Promise.resolve(),
+  );
   tauri.getByLabel.mockReset();
+  tauri.getCurrentWindow.mockReset();
+  tauri.emit.mockReset().mockResolvedValue(undefined);
+  tauri.listen.mockReset().mockResolvedValue(() => undefined);
   fetchHandler = async (_input, init) => {
     if (init?.method === "PUT") {
       return response(JSON.parse(String(init.body)));
@@ -354,9 +369,11 @@ describe("useWindowCluster ordered mutations", () => {
     };
     await mountReady();
     tauri.invoke.mockClear();
-    tauri.invoke.mockImplementation((command: string) =>
-      command === "set_cluster_edit_mode" ? enter.promise : Promise.resolve(),
-    );
+    tauri.invoke.mockImplementation((command: string) => {
+      if (command === "set_cluster_edit_mode") return enter.promise;
+      if (command === "get_cluster_geometry") return Promise.resolve(CLUSTER_GEOMETRY);
+      return Promise.resolve();
+    });
 
     let actions!: Promise<void>[];
     await act(async () => {
@@ -379,7 +396,7 @@ describe("useWindowCluster ordered mutations", () => {
 
     expect(tauri.invoke.mock.calls).toEqual([
       ["set_cluster_edit_mode", { enabled: true }],
-      ["apply_widget_layout", { layout: committed }],
+      ["get_cluster_geometry"],
       ["apply_widget_layout", { layout: committed }],
     ]);
     expect(latest.layout).toEqual(committed);
@@ -408,6 +425,187 @@ describe("useWindowCluster ordered mutations", () => {
 
     expect(tauri.invoke).toHaveBeenCalledWith("hide_widget_window", { widgetId: "music" });
     expect(latest.layout).toEqual(hidden);
+  });
+
+  it("keeps candidate edits unpersisted and Cancel restores the committed geometry", async () => {
+    await mountReady();
+    tauri.invoke.mockClear();
+    (fetch as ReturnType<typeof vi.fn>).mockClear();
+
+    await act(async () => latest.enterEdit());
+    expect(latest.editSession).toEqual({
+      committed: INITIAL_LAYOUT,
+      candidate: { ...INITIAL_LAYOUT, editMode: true },
+      dirty: false,
+    });
+
+    await act(async () => latest.updatePlacement("music", { size: "wide", lane: "bottom" }));
+    expect(latest.editSession?.candidate.placements[0]).toMatchObject({ size: "wide", lane: "bottom" });
+    expect(latest.editSession?.dirty).toBe(true);
+    expect(fetch).not.toHaveBeenCalled();
+
+    await act(async () => latest.cancelEdit());
+    expect(fetch).not.toHaveBeenCalled();
+    expect(tauri.invoke.mock.calls).toEqual([
+      ["set_cluster_edit_mode", { enabled: true }],
+      ["get_cluster_geometry"],
+      ["apply_widget_layout", { layout: INITIAL_LAYOUT }],
+    ]);
+    expect(latest.editSession).toBeNull();
+    expect(latest.layout).toEqual(INITIAL_LAYOUT);
+  });
+
+  it("Done performs exactly one canonical PUT and one native geometry apply", async () => {
+    await mountReady();
+    await act(async () => latest.enterEdit());
+    tauri.invoke.mockClear();
+    (fetch as ReturnType<typeof vi.fn>).mockClear();
+
+    await act(async () => latest.updatePlacement("music", { size: "compact" }));
+    expect(fetch).not.toHaveBeenCalled();
+    expect(tauri.invoke).not.toHaveBeenCalled();
+
+    await act(async () => latest.commitEdit());
+    const saved = {
+      ...INITIAL_LAYOUT,
+      placements: [{ ...INITIAL_LAYOUT.placements[0]!, size: "compact" as const }],
+    };
+    const puts = (fetch as ReturnType<typeof vi.fn>).mock.calls
+      .filter(([, init]) => init?.method === "PUT");
+    expect(puts).toHaveLength(1);
+    expect(puts[0]?.[1]?.body).toBe(JSON.stringify(saved));
+    expect(tauri.invoke.mock.calls).toEqual([
+      ["apply_widget_layout", { layout: saved }],
+    ]);
+    expect(latest.editSession).toBeNull();
+    expect(latest.layout).toEqual(saved);
+  });
+
+  it("computes settings-driven candidate overflow from bounded native geometry", async () => {
+    const visibleLeft = { ...INITIAL_LAYOUT, leftVisible: true };
+    fetchHandler = async (_input, init) =>
+      init?.method === "PUT" ? response(JSON.parse(String(init.body))) : response(visibleLeft);
+    tauri.invoke.mockImplementation((command: string) => command === "get_cluster_geometry"
+      ? Promise.resolve({
+        main: { x: 400, y: 40, width: 300, height: 420 },
+        output: { x: 0, y: 0, width: 800, height: 600 },
+      })
+      : Promise.resolve());
+    await mountReady();
+
+    await act(async () => latest.enterEdit());
+    await act(async () => latest.updatePlacement("system", {
+      side: "left",
+      order: 1,
+      lane: "top",
+      size: "standard",
+      visible: true,
+    }));
+
+    expect(tauri.invoke).toHaveBeenCalledWith("get_cluster_geometry");
+    expect(latest.overflowCount).toBe(1);
+    expect((fetch as ReturnType<typeof vi.fn>).mock.calls.filter(([, init]) => init?.method === "PUT"))
+      .toHaveLength(0);
+  });
+
+  it("accepts a nearest-slot drag without persistence and pushes an occupied placement", async () => {
+    const dragLayout: ClusterLayoutV1 = {
+      ...INITIAL_LAYOUT,
+      leftVisible: true,
+      rightVisible: true,
+      placements: [
+        INITIAL_LAYOUT.placements[0]!,
+        { widgetId: "system", side: "left", order: 1, lane: "top", size: "compact", visible: true },
+        { widgetId: "rvc", side: "right", order: 0, lane: "top", size: "standard", visible: true },
+      ],
+    };
+    fetchHandler = async (_input, init) =>
+      init?.method === "PUT" ? response(JSON.parse(String(init.body))) : response(dragLayout);
+    tauri.invoke.mockImplementation((command: string) => {
+      if (command === "get_cluster_geometry") return Promise.resolve(CLUSTER_GEOMETRY);
+      if (command === "complete_widget_drag") {
+        return Promise.resolve({
+          dragged: { x: 345, y: 334, width: 250, height: 190 },
+          main: { x: 600, y: 330, width: 720, height: 420 },
+          output: { x: 0, y: 0, width: 1920, height: 1080 },
+        });
+      }
+      return Promise.resolve();
+    });
+    await mountReady();
+    await act(async () => latest.enterEdit());
+    tauri.invoke.mockClear();
+    (fetch as ReturnType<typeof vi.fn>).mockClear();
+
+    await act(async () => latest.completeDrag("rvc"));
+
+    expect(latest.editSession?.candidate.placements.filter((placement) => placement.side === "left"))
+      .toEqual([
+        expect.objectContaining({ widgetId: "rvc", order: 0 }),
+        expect.objectContaining({ widgetId: "music", order: 1 }),
+        expect.objectContaining({ widgetId: "system", order: 2 }),
+      ]);
+    expect(fetch).not.toHaveBeenCalled();
+    expect(tauri.invoke.mock.calls[0]).toEqual(["complete_widget_drag", { widgetId: "rvc" }]);
+    expect(tauri.invoke.mock.calls[1]).toEqual([
+      "apply_widget_layout",
+      { layout: latest.editSession?.candidate },
+    ]);
+  });
+
+  it("rejects an out-of-bounds drag and restores committed geometry", async () => {
+    tauri.invoke.mockImplementation((command: string) => {
+      if (command === "get_cluster_geometry") return Promise.resolve(CLUSTER_GEOMETRY);
+      if (command === "complete_widget_drag") {
+        return Promise.resolve({
+          dragged: { x: -100, y: 330, width: 250, height: 190 },
+          main: { x: 600, y: 330, width: 720, height: 420 },
+          output: { x: 0, y: 0, width: 1920, height: 1080 },
+        });
+      }
+      return Promise.resolve();
+    });
+    await mountReady();
+    await act(async () => latest.enterEdit());
+    await act(async () => latest.updatePlacement("music", { size: "wide" }));
+    tauri.invoke.mockClear();
+    (fetch as ReturnType<typeof vi.fn>).mockClear();
+
+    await act(async () => latest.completeDrag("music"));
+
+    expect(fetch).not.toHaveBeenCalled();
+    expect(tauri.invoke.mock.calls).toEqual([
+      ["complete_widget_drag", { widgetId: "music" }],
+      ["apply_widget_layout", { layout: { ...INITIAL_LAYOUT, editMode: true } }],
+    ]);
+    expect(latest.editSession?.candidate).toEqual({ ...INITIAL_LAYOUT, editMode: true });
+  });
+
+  it("retains known geometry after a drag snapshot failure restores committed placement", async () => {
+    const visibleLeft = { ...INITIAL_LAYOUT, leftVisible: true };
+    fetchHandler = async (_input, init) =>
+      init?.method === "PUT" ? response(JSON.parse(String(init.body))) : response(visibleLeft);
+    const smallGeometry = {
+      main: { x: 400, y: 40, width: 300, height: 420 },
+      output: { x: 0, y: 0, width: 800, height: 600 },
+    };
+    tauri.invoke.mockImplementation((command: string) => {
+      if (command === "get_cluster_geometry") return Promise.resolve(smallGeometry);
+      if (command === "complete_widget_drag") return Promise.reject(new Error("snapshot failed"));
+      return Promise.resolve();
+    });
+    await mountReady();
+    await act(async () => latest.enterEdit());
+
+    await act(async () => latest.completeDrag("music"));
+    await act(async () => latest.updatePlacement("system", {
+      side: "left",
+      order: 1,
+      size: "standard",
+      visible: true,
+    }));
+
+    expect(latest.overflowCount).toBe(1);
   });
 });
 

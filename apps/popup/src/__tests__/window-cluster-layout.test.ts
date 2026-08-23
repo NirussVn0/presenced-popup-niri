@@ -1,5 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { findNearestSlot, insertPlacement, projectClusterLayout } from "../lib/window-cluster-layout.js";
+import {
+  createTutorialLayout,
+  findNearestSlot,
+  insertPlacement,
+  projectClusterLayout,
+  resetCandidateLayout,
+  snapDraggedPlacement,
+} from "../lib/window-cluster-layout.js";
 
 const main = { x: 600, y: 330, width: 720, height: 420 };
 const output = { x: 0, y: 0, width: 1920, height: 1080 };
@@ -96,4 +103,76 @@ describe("findNearestSlot", () => {
 
 it("inserts at the requested index after removing an existing occurrence", () => {
   expect(insertPlacement(["music", "system", "rvc"], "system", 2)).toEqual(["music", "rvc", "system"]);
+});
+
+describe("magnetic candidate helpers", () => {
+  const occupied = {
+    version: 1 as const,
+    leftVisible: true,
+    rightVisible: false,
+    editMode: true,
+    placements: [
+      { widgetId: "music" as const, side: "left" as const, order: 0, lane: "top" as const, size: "standard" as const, visible: true },
+      { widgetId: "system" as const, side: "left" as const, order: 1, lane: "top" as const, size: "compact" as const, visible: true },
+      { widgetId: "rvc" as const, side: "right" as const, order: 0, lane: "top" as const, size: "standard" as const, visible: true },
+    ],
+  };
+
+  it("inserts a dragged placement into an occupied slot and pushes existing orders", () => {
+    const snapped = snapDraggedPlacement(occupied, "rvc", {
+      dragged: { x: 345, y: 334, width: 250, height: 190 },
+      main,
+      output,
+    });
+
+    expect(snapped?.placements.filter((placement) => placement.side === "left"))
+      .toEqual([
+        expect.objectContaining({ widgetId: "rvc", order: 0, lane: "top" }),
+        expect.objectContaining({ widgetId: "music", order: 1 }),
+        expect.objectContaining({ widgetId: "system", order: 2 }),
+      ]);
+  });
+
+  it("rejects out-of-bounds and distant drops", () => {
+    expect(snapDraggedPlacement(occupied, "rvc", {
+      dragged: { x: -20, y: 330, width: 250, height: 190 },
+      main,
+      output,
+    })).toBeNull();
+    expect(snapDraggedPlacement(occupied, "rvc", {
+      dragged: { x: 900, y: 40, width: 250, height: 190 },
+      main,
+      output,
+    })).toBeNull();
+  });
+
+  it("resets the candidate to main-only edit mode", () => {
+    expect(resetCandidateLayout()).toEqual({
+      version: 1,
+      leftVisible: false,
+      rightVisible: false,
+      editMode: true,
+      placements: [],
+    });
+  });
+
+  it("creates one valid deterministic tutorial layout from explicit selections", () => {
+    expect(createTutorialLayout(["music", "lyrics"])).toEqual({
+      version: 1,
+      leftVisible: true,
+      rightVisible: true,
+      editMode: false,
+      placements: [
+        { widgetId: "music", side: "left", order: 0, lane: "top", size: "standard", visible: true },
+        { widgetId: "lyrics", side: "right", order: 0, lane: "bottom", size: "tall", visible: true },
+      ],
+    });
+    expect(createTutorialLayout([])).toEqual({
+      version: 1,
+      leftVisible: false,
+      rightVisible: false,
+      editMode: false,
+      placements: [],
+    });
+  });
 });

@@ -12,7 +12,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tauri::async_runtime::Mutex as AsyncMutex;
 use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder, WindowEvent};
 
@@ -380,7 +380,7 @@ fn validate_layout(payload: ClusterLayoutV1Payload) -> Result<ValidatedClusterLa
     })
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 struct Rect {
     x: i32,
     y: i32,
@@ -529,6 +529,96 @@ struct NiriWindow {
 
 fn parse_niri_windows(payload: &[u8]) -> Result<Vec<NiriWindow>, String> {
     serde_json::from_slice(payload).map_err(|error| format!("invalid Niri windows JSON: {error}"))
+}
+
+fn niri_window_rect(windows: &[NiriWindow], pid: u32, label: WindowLabel) -> Result<Rect, String> {
+    let matching: Vec<_> = windows
+        .iter()
+        .filter(|window| {
+            window.pid == u64::from(pid) && WindowLabel::from_title(&window.title) == Some(label)
+        })
+        .collect();
+    if matching.len() != 1 {
+        return Err(format!(
+            "expected exactly one Niri window for {}, found {}",
+            label.label(),
+            matching.len()
+        ));
+    }
+    let layout = matching[0]
+        .layout
+        .as_ref()
+        .ok_or_else(|| format!("{} Niri layout is missing", label.label()))?;
+    let position = layout
+        .tile_pos_in_workspace_view
+        .ok_or_else(|| format!("{} Niri position is missing", label.label()))?;
+    let size = layout
+        .window_size
+        .ok_or_else(|| format!("{} Niri size is missing", label.label()))?;
+    if !position[0].is_finite()
+        || !position[1].is_finite()
+        || position[0].round() < f64::from(i32::MIN)
+        || position[0].round() > f64::from(i32::MAX)
+        || position[1].round() < f64::from(i32::MIN)
+        || position[1].round() > f64::from(i32::MAX)
+        || size[0] == 0
+        || size[1] == 0
+    {
+        return Err(format!("{} Niri rectangle is invalid", label.label()));
+    }
+    Ok(Rect {
+        x: position[0].round() as i32,
+        y: position[1].round() as i32,
+        width: size[0],
+        height: size[1],
+    })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub(crate) struct DragSnapshotPayload {
+    dragged: Rect,
+    main: Rect,
+    output: Rect,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub(crate) struct ClusterGeometryPayload {
+    main: Rect,
+    output: Rect,
+}
+
+fn cluster_geometry_from_payload(
+    payload: &[u8],
+    pid: u32,
+    output: Rect,
+) -> Result<ClusterGeometryPayload, String> {
+    if output.width == 0 || output.height == 0 {
+        return Err("Niri output rectangle is invalid".to_owned());
+    }
+    find_niri_windows(payload, pid)?;
+    let windows = parse_niri_windows(payload)?;
+    Ok(ClusterGeometryPayload {
+        main: niri_window_rect(&windows, pid, WindowLabel::Main)?,
+        output,
+    })
+}
+
+fn drag_snapshot_from_payload(
+    payload: &[u8],
+    pid: u32,
+    widget_id: WidgetId,
+    output: Rect,
+) -> Result<DragSnapshotPayload, String> {
+    if output.width == 0 || output.height == 0 {
+        return Err("Niri output rectangle is invalid".to_owned());
+    }
+    find_niri_windows(payload, pid)?;
+    let windows = parse_niri_windows(payload)?;
+    Ok(DragSnapshotPayload {
+        dragged: niri_window_rect(&windows, pid, widget_id.window_label())?,
+        main: niri_window_rect(&windows, pid, WindowLabel::Main)?,
+        output,
+    })
 }
 
 fn find_niri_windows(payload: &[u8], pid: u32) -> Result<HashMap<String, u64>, String> {
@@ -958,6 +1048,82 @@ pub(crate) fn hide_widget_window(
     Ok(())
 }
 
+#[tauri::command]
+pub(crate) async fn complete_widget_drag(
+    state: State<'_, WindowClusterController>,
+    widget_id: String,
+) -> Result<DragSnapshotPayload, String> {
+    let widget_id = WidgetId::from_str(&widget_id)?;
+    {
+        let data = state
+            .data
+            .lock()
+            .map_err(|_| "window cluster state is unavailable".to_owned())?;
+        let layout = data
+            .layout
+            .as_ref()
+            .ok_or_else(|| "window cluster is not initialized".to_owned())?;
+        if !layout.edit_mode {
+            return Err("window cluster is not in edit mode".to_owned());
+        }
+        if !layout
+            .placements
+            .iter()
+            .any(|placement| placement.widget_id == widget_id && placement.visible)
+        {
+            return Err("dragged widget has no visible placement".to_owned());
+        }
+    }
+    let output = current_output_rect(&state.app)?;
+
+    #[cfg(target_os = "linux")]
+    {
+        let pid = state.pid;
+        tauri::async_runtime::spawn_blocking(move || {
+            let snapshot = run_niri_command(&["msg", "--json", "windows"])?;
+            if !snapshot.success {
+                return Err("Niri windows command failed".to_owned());
+            }
+            drag_snapshot_from_payload(&snapshot.stdout, pid, widget_id, output)
+        })
+        .await
+        .map_err(|error| format!("Niri drag snapshot worker failed: {error}"))?
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (widget_id, output);
+        Err("Niri drag completion is only available on Linux".to_owned())
+    }
+}
+
+#[tauri::command]
+pub(crate) async fn get_cluster_geometry(
+    state: State<'_, WindowClusterController>,
+) -> Result<ClusterGeometryPayload, String> {
+    let output = current_output_rect(&state.app)?;
+
+    #[cfg(target_os = "linux")]
+    {
+        let pid = state.pid;
+        tauri::async_runtime::spawn_blocking(move || {
+            let snapshot = run_niri_command(&["msg", "--json", "windows"])?;
+            if !snapshot.success {
+                return Err("Niri windows command failed".to_owned());
+            }
+            cluster_geometry_from_payload(&snapshot.stdout, pid, output)
+        })
+        .await
+        .map_err(|error| format!("Niri geometry worker failed: {error}"))?
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = output;
+        Err("Niri geometry is only available on Linux".to_owned())
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn wait_for_child_with_timeout(child: &mut Child, timeout: Duration) -> Result<ExitStatus, String> {
     let started = Instant::now();
@@ -1104,29 +1270,7 @@ fn center_main_window_on_niri(_pid: u32) {}
 
 #[cfg(target_os = "linux")]
 fn main_rect(windows: &[NiriWindow], pid: u32) -> Result<Rect, String> {
-    let main = windows
-        .iter()
-        .find(|window| {
-            window.pid == u64::from(pid)
-                && WindowLabel::from_title(&window.title) == Some(WindowLabel::Main)
-        })
-        .ok_or_else(|| "main Niri window is missing".to_owned())?;
-    let layout = main
-        .layout
-        .as_ref()
-        .ok_or_else(|| "main Niri layout is missing".to_owned())?;
-    let position = layout
-        .tile_pos_in_workspace_view
-        .ok_or_else(|| "main Niri position is missing".to_owned())?;
-    let size = layout
-        .window_size
-        .ok_or_else(|| "main Niri size is missing".to_owned())?;
-    Ok(Rect {
-        x: position[0].round() as i32,
-        y: position[1].round() as i32,
-        width: size[0],
-        height: size[1],
-    })
+    niri_window_rect(windows, pid, WindowLabel::Main)
 }
 
 #[cfg(target_os = "linux")]
@@ -1212,10 +1356,11 @@ async fn reapply_niri_layout(
 #[cfg(test)]
 mod tests {
     use super::{
-        close_disposition, committed_visibility, find_niri_windows, project_layout,
-        validate_layout, visible_projected_widget_ids, wait_for_child_with_timeout,
-        AppliedNiriLayout, ApplyGenerationTracker, CloseDisposition, ClusterLayoutV1Payload, Lane,
-        Rect, Side, SizePreset, WidgetId, WidgetPlacementPayload, WindowLabel, WINDOW_REGISTRY,
+        close_disposition, cluster_geometry_from_payload, committed_visibility,
+        drag_snapshot_from_payload, find_niri_windows, project_layout, validate_layout,
+        visible_projected_widget_ids, wait_for_child_with_timeout, AppliedNiriLayout,
+        ApplyGenerationTracker, CloseDisposition, ClusterLayoutV1Payload, Lane, Rect, Side,
+        SizePreset, WidgetId, WidgetPlacementPayload, WindowLabel, WINDOW_REGISTRY,
     };
     use std::{
         collections::HashSet,
@@ -1329,6 +1474,80 @@ mod tests {
         ]"#;
 
         assert!(find_niri_windows(json, 55).is_err());
+    }
+
+    #[test]
+    fn returns_validated_plain_drag_main_and_output_rectangles_from_one_snapshot() {
+        let json = br#"[
+          {"id": 11, "pid": 55, "title": "presenced:widget-main", "layout": {"tile_pos_in_workspace_view": [600.0, 330.0], "window_size": [720, 420]}},
+          {"id": 12, "pid": 55, "title": "presenced:widget-rvc", "layout": {"tile_pos_in_workspace_view": [345.0, 334.0], "window_size": [250, 190]}}
+        ]"#;
+        let output = Rect {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        };
+
+        let snapshot = drag_snapshot_from_payload(json, 55, WidgetId::Rvc, output).unwrap();
+
+        assert_eq!(
+            snapshot.dragged,
+            Rect {
+                x: 345,
+                y: 334,
+                width: 250,
+                height: 190
+            }
+        );
+        assert_eq!(
+            snapshot.main,
+            Rect {
+                x: 600,
+                y: 330,
+                width: 720,
+                height: 420
+            }
+        );
+        assert_eq!(snapshot.output, output);
+        let geometry = cluster_geometry_from_payload(json, 55, output).unwrap();
+        assert_eq!(geometry.main, snapshot.main);
+        assert_eq!(geometry.output, output);
+        assert_eq!(
+            serde_json::to_value(snapshot).unwrap(),
+            serde_json::json!({
+                "dragged": {"x": 345, "y": 334, "width": 250, "height": 190},
+                "main": {"x": 600, "y": 330, "width": 720, "height": 420},
+                "output": {"x": 0, "y": 0, "width": 1920, "height": 1080}
+            })
+        );
+    }
+
+    #[test]
+    fn drag_snapshot_rejects_missing_duplicate_or_invalid_rectangles() {
+        let output = Rect {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        };
+        let missing_dragged = br#"[
+          {"id": 11, "pid": 55, "title": "presenced:widget-main", "layout": {"tile_pos_in_workspace_view": [600.0, 330.0], "window_size": [720, 420]}}
+        ]"#;
+        assert!(drag_snapshot_from_payload(missing_dragged, 55, WidgetId::Rvc, output).is_err());
+
+        let duplicate_dragged = br#"[
+          {"id": 11, "pid": 55, "title": "presenced:widget-main", "layout": {"tile_pos_in_workspace_view": [600.0, 330.0], "window_size": [720, 420]}},
+          {"id": 12, "pid": 55, "title": "presenced:widget-rvc", "layout": {"tile_pos_in_workspace_view": [345.0, 334.0], "window_size": [250, 190]}},
+          {"id": 13, "pid": 55, "title": "presenced:widget-rvc", "layout": {"tile_pos_in_workspace_view": [346.0, 334.0], "window_size": [250, 190]}}
+        ]"#;
+        assert!(drag_snapshot_from_payload(duplicate_dragged, 55, WidgetId::Rvc, output).is_err());
+
+        let zero_sized = br#"[
+          {"id": 11, "pid": 55, "title": "presenced:widget-main", "layout": {"tile_pos_in_workspace_view": [600.0, 330.0], "window_size": [720, 420]}},
+          {"id": 12, "pid": 55, "title": "presenced:widget-rvc", "layout": {"tile_pos_in_workspace_view": [345.0, 334.0], "window_size": [0, 190]}}
+        ]"#;
+        assert!(drag_snapshot_from_payload(zero_sized, 55, WidgetId::Rvc, output).is_err());
     }
 
     #[test]

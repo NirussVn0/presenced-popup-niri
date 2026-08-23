@@ -41,6 +41,7 @@ export function App() {
     enterEdit,
     commitEdit,
     cancelEdit,
+    applyTutorialSelection,
   } = useWindowCluster();
   const editMode = layout?.editMode ?? false;
 
@@ -67,7 +68,11 @@ export function App() {
 
   return (
     <>
-      <TutorialOverlay />
+      <TutorialOverlay
+        disabled={clusterLoading || !layout}
+        onFinish={applyTutorialSelection}
+        onSkip={() => applyTutorialSelection([])}
+      />
       <div className="relative h-screen w-screen select-none overflow-hidden p-2 font-sans">
         <div className="flex h-full w-full min-w-0 flex-col gap-2">
           <motion.div

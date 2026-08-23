@@ -11,13 +11,15 @@ import { RvcSettings } from "./RvcSettings.js";
 import { QuoteSettings } from "./QuoteSettings.js";
 import { ThemeSettings } from "./ThemeSettings.js";
 import type { ThemeConfig } from "../hooks/useTheme.js";
+import { useLayoutSettingsActions } from "../hooks/useWindowCluster.js";
+import { LayoutSettings } from "./LayoutSettings.js";
 import { Music, MessageSquare, Timer, CalendarClock, Mic2, Cpu, Wifi, Shield, Palette, FileText, Settings as SettingsIcon, ToggleLeft, ToggleRight } from "lucide-react";
 
 const ICON_MAP: Record<string, React.ComponentType<{ className?: string }>> = {
   Music, MessageSquare, Timer, CalendarClock, Mic2, Cpu, Wifi, Shield,
 };
 
-type SettingsTab = "widgets" | "rvc" | "theme" | "quotes" | "discord" | "about";
+type SettingsTab = "widgets" | "layout" | "rvc" | "theme" | "quotes" | "discord" | "about";
 
 interface SettingsPanelProps {
   visibility: Record<WidgetId, boolean>;
@@ -38,6 +40,7 @@ interface SettingsPanelProps {
 
 const TABS: { id: SettingsTab; label: string; icon: React.ComponentType<{ className?: string }> }[] = [
   { id: "widgets", label: "Widgets", icon: Layout },
+  { id: "layout", label: "Layout", icon: Layout },
   { id: "rvc", label: "RVC", icon: MessageSquare },
   { id: "theme", label: "Theme", icon: Palette },
   { id: "quotes", label: "Quotes", icon: FileText },
@@ -65,6 +68,7 @@ export const SettingsPanel = ({
   const [activeTab, setActiveTab] = useState<SettingsTab>("widgets");
   const [discordClientId, setDiscordClientId] = useState("");
   const [discordSocketPath, setDiscordSocketPath] = useState("");
+  const cluster = useLayoutSettingsActions();
 
   useEffect(() => {
     getDiscordConfig().then((c) => {
@@ -106,6 +110,34 @@ export const SettingsPanel = ({
                 </motion.button>
               );
             })}
+          </div>
+        )}
+
+        {activeTab === "layout" && (
+          <div className="space-y-2">
+            <div className="flex items-center gap-1">
+              {cluster.editMode ? (
+                <>
+                  <button type="button" onClick={() => void cluster.commitEdit()} className="rounded-niri bg-accent-primary px-2 py-1 font-bold text-white">Done</button>
+                  <button type="button" onClick={() => void cluster.cancelEdit()} className="glass-surface rounded-niri px-2 py-1 text-text-secondary">Cancel</button>
+                </>
+              ) : (
+                <button type="button" onClick={() => void cluster.enterEdit()} disabled={!cluster.layout} className="rounded-niri bg-accent-primary px-2 py-1 font-bold text-white disabled:opacity-40">Edit layout</button>
+              )}
+            </div>
+            {cluster.layout ? (
+              <LayoutSettings
+                layout={cluster.layout}
+                overflowCount={cluster.overflowCount}
+                disabled={!cluster.editMode}
+                onChange={(widgetId, changes) => void cluster.updatePlacement(widgetId, changes)}
+                onReset={() => void cluster.resetEdit()}
+              />
+            ) : (
+              <div role="status" className="rounded-niri bg-status-degraded/15 p-2 text-status-degraded">
+                Waiting for the main window cluster controller.
+              </div>
+            )}
           </div>
         )}
 
