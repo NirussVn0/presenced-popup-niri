@@ -26,7 +26,7 @@ const LAYOUT_STREAM_LIMITATION =
   "Layout synchronization is paused because the daemon event stream is disconnected; no polling fallback is used.";
 const LAYOUT_ACTION_EVENT = "cluster-layout-action";
 const LAYOUT_STATE_EVENT = "cluster-layout-state";
-const DRAG_MOVE_SETTLE_MS = 180;
+const NATIVE_DRAG_RELEASE_EVENT = "cluster-native-drag-release";
 const DRAG_COMPLETION_TIMEOUT_MS = 2500;
 
 export interface EditSession {
@@ -856,18 +856,24 @@ export interface UseWidgetWindowActionsReturn {
   cycleSize: (widgetId: WidgetWindowId) => Promise<void>;
 }
 
-type NativeDragWindow = Pick<ReturnType<typeof getCurrentWindow>, "onMoved" | "startDragging">;
+type NativeDragWindow = Pick<ReturnType<typeof getCurrentWindow>, "label" | "startDragging">;
 
-function waitForNativeMoveCompletion(window: NativeDragWindow, signal: AbortSignal) {
+function widgetWindowLabel(widgetId: WidgetWindowId) {
+  return `widget-${widgetId}`;
+}
+
+function waitForNativeDragRelease(
+  windowLabel: string,
+  dragToken: number,
+  signal: AbortSignal,
+) {
   let finished = false;
   let unlisten: (() => void) | undefined;
-  let settleTimer: ReturnType<typeof setTimeout> | undefined;
   let timeoutTimer: ReturnType<typeof setTimeout> | undefined;
   let resolveCompletion!: () => void;
   let rejectCompletion!: (error: unknown) => void;
 
   const cleanup = () => {
-    if (settleTimer !== undefined) clearTimeout(settleTimer);
     if (timeoutTimer !== undefined) clearTimeout(timeoutTimer);
     signal.removeEventListener("abort", abort);
     unlisten?.();
@@ -889,10 +895,11 @@ function waitForNativeMoveCompletion(window: NativeDragWindow, signal: AbortSign
     resolveCompletion = resolvePromise;
     rejectCompletion = rejectPromise;
   });
-  const ready = window.onMoved(() => {
-    if (finished) return;
-    if (settleTimer !== undefined) clearTimeout(settleTimer);
-    settleTimer = setTimeout(resolve, DRAG_MOVE_SETTLE_MS);
+  const ready = listen<unknown>(NATIVE_DRAG_RELEASE_EVENT, (event) => {
+    if (finished || !event.payload || typeof event.payload !== "object") return;
+    const payload = event.payload as Record<string, unknown>;
+    if (payload.windowLabel !== windowLabel || payload.dragToken !== dragToken) return;
+    resolve();
   }).then((stop) => {
     if (finished) stop();
     else unlisten = stop;
@@ -900,7 +907,7 @@ function waitForNativeMoveCompletion(window: NativeDragWindow, signal: AbortSign
 
   signal.addEventListener("abort", abort, { once: true });
   timeoutTimer = setTimeout(
-    () => reject(new Error("Native window drag produced no bounded completion evidence")),
+    () => reject(new Error("Native window drag produced no bounded button-release evidence")),
     DRAG_COMPLETION_TIMEOUT_MS,
   );
   if (signal.aborted) abort();
@@ -989,7 +996,7 @@ export function useWidgetWindowActions(): UseWidgetWindowActionsReturn {
     activeDragControllerRef.current = controller;
     actionControllersRef.current.add(controller);
     let dragToken: number | undefined;
-    let completion: ReturnType<typeof waitForNativeMoveCompletion> | undefined;
+    let completion: ReturnType<typeof waitForNativeDragRelease> | undefined;
     try {
       const prepared = await invoke<number>("prepare_widget_drag", { widgetId });
       requireActiveAction(mountedRef, controller.signal);
@@ -997,8 +1004,16 @@ export function useWidgetWindowActions(): UseWidgetWindowActionsReturn {
         throw new Error("Native drag preparation returned an invalid token");
       }
       dragToken = prepared;
-      const window = getCurrentWindow();
-      completion = waitForNativeMoveCompletion(window, controller.signal);
+      const window: NativeDragWindow = getCurrentWindow();
+      const expectedWindowLabel = widgetWindowLabel(widgetId);
+      if (window.label !== expectedWindowLabel) {
+        throw new Error("Native drag was requested from the wrong widget window");
+      }
+      completion = waitForNativeDragRelease(
+        expectedWindowLabel,
+        dragToken,
+        controller.signal,
+      );
       await Promise.race([completion.ready, completion.completion]);
       requireActiveAction(mountedRef, controller.signal);
       await Promise.all([window.startDragging(), completion.completion]);

@@ -18,7 +18,11 @@ use serde::{Deserialize, Serialize};
 use tauri::async_runtime::Mutex as AsyncMutex;
 use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder, WindowEvent};
 
+#[cfg(target_os = "linux")]
+use gtk::prelude::{WidgetExt, WidgetExtManual};
+
 const CLUSTER_GAP: i32 = 10;
+const NATIVE_DRAG_RELEASE_EVENT: &str = "cluster-native-drag-release";
 #[cfg(target_os = "linux")]
 const DISCOVERY_ATTEMPTS: usize = 40;
 #[cfg(target_os = "linux")]
@@ -29,6 +33,8 @@ const DISCOVERY_DELAY: Duration = Duration::from_millis(50);
 const OPENING_SETTLE_DELAY: Duration = Duration::from_millis(1000);
 #[cfg(target_os = "linux")]
 const CENTER_RETRY_DELAY: Duration = Duration::from_millis(500);
+#[cfg(target_os = "linux")]
+const NATIVE_RELEASE_REGISTRATION_TIMEOUT: Duration = Duration::from_millis(2500);
 #[cfg(target_os = "linux")]
 const NIRI_EXEC_TIMEOUT: Duration = Duration::from_millis(1500);
 #[cfg(target_os = "linux")]
@@ -705,10 +711,58 @@ impl ApplyGenerationTracker {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NativeDragReleasePayload {
+    window_label: &'static str,
+    drag_token: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
 struct PreparedDrag {
     widget_id: WidgetId,
     origin: DragSnapshotPayload,
+    release_observed: bool,
+}
+
+fn observe_native_drag_release(
+    prepared_drags: &mut HashMap<u64, PreparedDrag>,
+    window_label: WindowLabel,
+) -> Option<NativeDragReleasePayload> {
+    let WindowLabel::Widget(widget_id) = window_label else {
+        return None;
+    };
+    let matching_tokens: Vec<_> = prepared_drags
+        .iter()
+        .filter_map(|(token, prepared)| {
+            (prepared.widget_id == widget_id && !prepared.release_observed).then_some(*token)
+        })
+        .collect();
+    let [drag_token] = matching_tokens.as_slice() else {
+        return None;
+    };
+    prepared_drags.get_mut(drag_token)?.release_observed = true;
+    Some(NativeDragReleasePayload {
+        window_label: window_label.label(),
+        drag_token: *drag_token,
+    })
+}
+
+fn take_released_drag(
+    prepared_drags: &mut HashMap<u64, PreparedDrag>,
+    widget_id: WidgetId,
+    drag_token: u64,
+) -> Result<PreparedDrag, String> {
+    let prepared = prepared_drags
+        .remove(&drag_token)
+        .ok_or_else(|| "native drag token is missing, expired, or already consumed".to_owned())?;
+    if prepared.widget_id != widget_id {
+        return Err("native drag token belongs to a different widget".to_owned());
+    }
+    if !prepared.release_observed {
+        return Err("native drag token has no authoritative button-release evidence".to_owned());
+    }
+    Ok(prepared)
 }
 
 struct ControllerData {
@@ -723,6 +777,82 @@ pub(crate) struct WindowClusterController {
     pid: u32,
     data: StdMutex<ControllerData>,
     apply_lock: AsyncMutex<()>,
+}
+
+#[cfg(target_os = "linux")]
+fn register_native_drag_release_observer(
+    app: &AppHandle,
+    window: &tauri::WebviewWindow,
+    window_label: WindowLabel,
+) -> Result<(), String> {
+    if !matches!(window_label, WindowLabel::Widget(_)) {
+        return Ok(());
+    }
+    let gtk_window = window.gtk_window().map_err(|error| {
+        format!(
+            "failed to access {} GTK window: {error}",
+            window_label.label()
+        )
+    })?;
+    gtk_window.add_events(gtk::gdk::EventMask::BUTTON_RELEASE_MASK);
+    let app_on_release = app.clone();
+    gtk_window.connect_event_after(move |_, event| {
+        let Some(button) = event.downcast_ref::<gtk::gdk::EventButton>() else {
+            return;
+        };
+        if event.event_type() != gtk::gdk::EventType::ButtonRelease || button.button() != 1 {
+            return;
+        }
+        let payload = app_on_release
+            .try_state::<WindowClusterController>()
+            .and_then(|state| {
+                state.data.lock().ok().and_then(|mut data| {
+                    observe_native_drag_release(&mut data.prepared_drags, window_label)
+                })
+            });
+        if let Some(payload) = payload {
+            let _ =
+                app_on_release.emit_to(window_label.label(), NATIVE_DRAG_RELEASE_EVENT, payload);
+        }
+    });
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn register_dynamic_native_drag_release_observer(
+    window: tauri::WebviewWindow,
+    window_label: WindowLabel,
+) -> Result<(), String> {
+    let app = window.app_handle().clone();
+    let window_on_main = window.clone();
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    window
+        .run_on_main_thread(move || {
+            let result = register_native_drag_release_observer(&app, &window_on_main, window_label);
+            let _ = sender.send(result);
+        })
+        .map_err(|error| {
+            format!(
+                "failed to schedule {} release observer: {error}",
+                window_label.label()
+            )
+        })?;
+    receiver
+        .recv_timeout(NATIVE_RELEASE_REGISTRATION_TIMEOUT)
+        .map_err(|_| {
+            format!(
+                "{} release observer registration did not finish within the deadline",
+                window_label.label()
+            )
+        })?
+}
+
+#[cfg(not(target_os = "linux"))]
+fn register_dynamic_native_drag_release_observer(
+    _window: tauri::WebviewWindow,
+    _window_label: WindowLabel,
+) -> Result<(), String> {
+    Err("authoritative native drag release observation is only available on Linux".to_owned())
 }
 
 pub(crate) fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
@@ -751,6 +881,13 @@ pub(crate) fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Erro
         }),
         apply_lock: AsyncMutex::new(()),
     });
+    #[cfg(target_os = "linux")]
+    for spec in WINDOW_REGISTRY.iter().filter(|spec| spec.magnetic) {
+        if let Some(window) = app.get_webview_window(spec.label.label()) {
+            register_native_drag_release_observer(app.handle(), &window, spec.label)
+                .map_err(std::io::Error::other)?;
+        }
+    }
     center_main_window_on_niri(std::process::id());
     Ok(())
 }
@@ -817,6 +954,14 @@ fn build_hidden_windows(app: &AppHandle) -> Result<(), String> {
             .visible(false)
             .build()
             .map_err(|error| format!("failed to build {label}: {error}"))?;
+        if spec.magnetic {
+            if let Err(error) =
+                register_dynamic_native_drag_release_observer(window.clone(), spec.label)
+            {
+                let _ = window.destroy();
+                return Err(error);
+            }
+        }
         let app_on_close = app.clone();
         let label_on_close = spec.label;
         window.on_window_event(move |event| {
@@ -1163,8 +1308,14 @@ pub(crate) async fn prepare_widget_drag(
     let token = data.next_drag_token;
     data.prepared_drags
         .retain(|_, prepared| prepared.widget_id != widget_id);
-    data.prepared_drags
-        .insert(token, PreparedDrag { widget_id, origin });
+    data.prepared_drags.insert(
+        token,
+        PreparedDrag {
+            widget_id,
+            origin,
+            release_observed: false,
+        },
+    );
     Ok(token)
 }
 
@@ -1195,13 +1346,7 @@ pub(crate) async fn complete_widget_drag(
             .lock()
             .map_err(|_| "window cluster state is unavailable".to_owned())?;
         validate_drag_layout(data.layout.as_ref(), widget_id)?;
-        let prepared = data.prepared_drags.remove(&drag_token).ok_or_else(|| {
-            "native drag token is missing, expired, or already consumed".to_owned()
-        })?;
-        if prepared.widget_id != widget_id {
-            return Err("native drag token belongs to a different widget".to_owned());
-        }
-        prepared
+        take_released_drag(&mut data.prepared_drags, widget_id, drag_token)?
     };
     let output = current_output_rect(&state.app)?;
 
@@ -1612,13 +1757,14 @@ async fn reapply_niri_layout(
 mod tests {
     use super::{
         close_disposition, cluster_geometry_from_payload, committed_visibility,
-        drag_snapshot_from_payload, find_niri_windows, project_layout, run_command_with_limits,
-        validate_completed_drag, validate_layout, visible_projected_widget_ids, AppliedNiriLayout,
-        ApplyGenerationTracker, CloseDisposition, ClusterLayoutV1Payload, Lane, Rect, Side,
-        SizePreset, WidgetId, WidgetPlacementPayload, WindowLabel, WINDOW_REGISTRY,
+        drag_snapshot_from_payload, find_niri_windows, observe_native_drag_release, project_layout,
+        run_command_with_limits, take_released_drag, validate_completed_drag, validate_layout,
+        visible_projected_widget_ids, AppliedNiriLayout, ApplyGenerationTracker, CloseDisposition,
+        ClusterLayoutV1Payload, Lane, PreparedDrag, Rect, Side, SizePreset, WidgetId,
+        WidgetPlacementPayload, WindowLabel, WINDOW_REGISTRY,
     };
     use std::{
-        collections::HashSet,
+        collections::{HashMap, HashSet},
         fs,
         time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     };
@@ -1934,6 +2080,110 @@ mod tests {
             }
         )
         .is_err());
+    }
+
+    #[test]
+    fn native_release_requires_exact_widget_label_and_is_one_use() {
+        let origin = super::DragSnapshotPayload {
+            dragged: Rect {
+                x: 340,
+                y: 330,
+                width: 250,
+                height: 190,
+            },
+            main: Rect {
+                x: 600,
+                y: 330,
+                width: 720,
+                height: 420,
+            },
+            output: Rect {
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 1080,
+            },
+        };
+        let mut prepared = HashMap::from([(
+            71,
+            PreparedDrag {
+                widget_id: WidgetId::Music,
+                origin,
+                release_observed: false,
+            },
+        )]);
+
+        assert!(observe_native_drag_release(&mut prepared, WindowLabel::Main).is_none());
+        assert!(
+            observe_native_drag_release(&mut prepared, WindowLabel::Widget(WidgetId::Rvc))
+                .is_none()
+        );
+        let release =
+            observe_native_drag_release(&mut prepared, WindowLabel::Widget(WidgetId::Music))
+                .unwrap();
+        assert_eq!(release.window_label, "widget-music");
+        assert_eq!(release.drag_token, 71);
+        assert!(
+            observe_native_drag_release(&mut prepared, WindowLabel::Widget(WidgetId::Music))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn completion_consumes_tokens_and_requires_prior_exact_release() {
+        let origin = super::DragSnapshotPayload {
+            dragged: Rect {
+                x: 340,
+                y: 330,
+                width: 250,
+                height: 190,
+            },
+            main: Rect {
+                x: 600,
+                y: 330,
+                width: 720,
+                height: 420,
+            },
+            output: Rect {
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 1080,
+            },
+        };
+        let prepared_drag = || PreparedDrag {
+            widget_id: WidgetId::Music,
+            origin,
+            release_observed: false,
+        };
+
+        let mut early = HashMap::from([(72, prepared_drag())]);
+        assert!(take_released_drag(&mut early, WidgetId::Music, 72)
+            .unwrap_err()
+            .contains("release"));
+        assert!(!early.contains_key(&72));
+
+        let mut wrong_widget = HashMap::from([(73, prepared_drag())]);
+        assert!(observe_native_drag_release(
+            &mut wrong_widget,
+            WindowLabel::Widget(WidgetId::Music)
+        )
+        .is_some());
+        assert!(take_released_drag(&mut wrong_widget, WidgetId::Rvc, 73).is_err());
+        assert!(!wrong_widget.contains_key(&73));
+
+        let mut completed = HashMap::from([(74, prepared_drag())]);
+        assert!(
+            observe_native_drag_release(&mut completed, WindowLabel::Widget(WidgetId::Music))
+                .is_some()
+        );
+        assert_eq!(
+            take_released_drag(&mut completed, WidgetId::Music, 74)
+                .unwrap()
+                .origin,
+            origin
+        );
+        assert!(take_released_drag(&mut completed, WidgetId::Music, 74).is_err());
     }
 
     #[test]

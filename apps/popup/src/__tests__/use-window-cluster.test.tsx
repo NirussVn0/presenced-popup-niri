@@ -667,18 +667,12 @@ describe("useWindowCluster ordered mutations", () => {
 });
 
 describe("window cluster multi-root ownership", () => {
-  it("waits for native move completion evidence before the beginDrag path can snapshot", async () => {
+  it("requires exact native release evidence and startDragging success before snapshotting", async () => {
     const bus = installTauriEventBus();
     const calls: string[] = [];
-    let movedHandler: (() => void) | undefined;
-    const stopMoved = vi.fn();
     const dragging = deferred<void>();
     tauri.getCurrentWindow.mockReturnValue({
-      onMoved: vi.fn(async (handler: () => void) => {
-        calls.push("listen-moved");
-        movedHandler = handler;
-        return stopMoved;
-      }),
+      label: "widget-music",
       startDragging: vi.fn(async () => {
         calls.push("start-dragging");
         await dragging.promise;
@@ -716,20 +710,18 @@ describe("window cluster multi-root ownership", () => {
       await Promise.resolve();
     });
 
-    expect(calls.indexOf("prepare_widget_drag")).toBeLessThan(calls.indexOf("listen-moved"));
-    expect(calls.indexOf("listen-moved")).toBeLessThan(calls.indexOf("start-dragging"));
+    expect(calls.indexOf("prepare_widget_drag")).toBeLessThan(calls.indexOf("start-dragging"));
+    expect(bus.listenerCount("cluster-native-drag-release")).toBe(1);
     expect(calls).not.toContain("complete_widget_drag");
 
     await act(async () => {
-      movedHandler?.();
-      await vi.advanceTimersByTimeAsync(100);
+      await vi.advanceTimersByTimeAsync(2400);
     });
     expect(calls).not.toContain("complete_widget_drag");
 
-    await act(async () => {
-      await vi.runAllTimersAsync();
-      await Promise.resolve();
-      await Promise.resolve();
+    await bus.emit("cluster-native-drag-release", {
+      windowLabel: "widget-music",
+      dragToken: 41,
     });
     expect(calls).not.toContain("complete_widget_drag");
 
@@ -740,15 +732,14 @@ describe("window cluster multi-root ownership", () => {
     });
     await until(() => expect(calls).toContain("complete_widget_drag"));
     expect(calls.indexOf("start-dragging")).toBeLessThan(calls.indexOf("complete_widget_drag"));
-    expect(stopMoved).toHaveBeenCalledOnce();
+    expect(bus.listenerCount("cluster-native-drag-release")).toBe(0);
     expect(bus.listenerCount("cluster-layout-action")).toBe(1);
   });
 
-  it("times out a beginDrag with no move evidence, cancels its token, and rolls back", async () => {
-    installTauriEventBus();
-    const stopMoved = vi.fn();
+  it("times out a beginDrag with no release evidence, cancels its token, and rolls back", async () => {
+    const bus = installTauriEventBus();
     tauri.getCurrentWindow.mockReturnValue({
-      onMoved: vi.fn(async () => stopMoved),
+      label: "widget-music",
       startDragging: vi.fn().mockResolvedValue(undefined),
     });
     tauri.invoke.mockImplementation((command: string) => {
@@ -790,14 +781,108 @@ describe("window cluster multi-root ownership", () => {
     expect(tauri.invoke).toHaveBeenCalledWith("apply_widget_layout", {
       layout: { ...INITIAL_LAYOUT, editMode: true },
     });
-    expect(stopMoved).toHaveBeenCalledOnce();
+    expect(bus.listenerCount("cluster-native-drag-release")).toBe(0);
+  });
+
+  it("ignores wrong-label, wrong-token, and duplicate release events", async () => {
+    const bus = installTauriEventBus();
+    tauri.getCurrentWindow.mockReturnValue({
+      label: "widget-music",
+      startDragging: vi.fn().mockResolvedValue(undefined),
+    });
+    tauri.invoke.mockImplementation((command: string) => {
+      if (command === "get_cluster_geometry") return Promise.resolve(CLUSTER_GEOMETRY);
+      if (command === "prepare_widget_drag") return Promise.resolve(44);
+      if (command === "complete_widget_drag") {
+        return Promise.resolve({
+          dragged: { x: 345, y: 334, width: 250, height: 190 },
+          main: CLUSTER_GEOMETRY.main,
+          output: CLUSTER_GEOMETRY.output,
+        });
+      }
+      return Promise.resolve();
+    });
+    await mountReady();
+    await act(async () => latest.enterEdit());
+    await act(async () => {
+      extraRenderers.push(create(
+        <WidgetWindowShell widgetId="music" title="Music"><div>music</div></WidgetWindowShell>,
+      ));
+    });
+    await until(() => expect(
+      extraRenderers[0]!.root.findAllByProps({ "aria-label": "Drag Music" }),
+    ).toHaveLength(1));
+
+    extraRenderers[0]!.root.findByProps({ "aria-label": "Drag Music" }).props.onPointerDown();
+    await until(() => expect(bus.listenerCount("cluster-native-drag-release")).toBe(1));
+
+    await bus.emit("cluster-native-drag-release", {
+      windowLabel: "widget-rvc",
+      dragToken: 44,
+    });
+    await bus.emit("cluster-native-drag-release", {
+      windowLabel: "widget-music",
+      dragToken: 45,
+    });
+    expect(tauri.invoke.mock.calls.filter(([command]) => command === "complete_widget_drag"))
+      .toHaveLength(0);
+
+    await bus.emit("cluster-native-drag-release", {
+      windowLabel: "widget-music",
+      dragToken: 44,
+    });
+    await until(() => expect(
+      tauri.invoke.mock.calls.filter(([command]) => command === "complete_widget_drag"),
+    ).toHaveLength(1));
+    await bus.emit("cluster-native-drag-release", {
+      windowLabel: "widget-music",
+      dragToken: 44,
+    });
+    expect(tauri.invoke.mock.calls.filter(([command]) => command === "complete_widget_drag"))
+      .toHaveLength(1);
+  });
+
+  it("cancels a released token when startDragging rejects", async () => {
+    const bus = installTauriEventBus();
+    const dragging = deferred<void>();
+    tauri.getCurrentWindow.mockReturnValue({
+      label: "widget-music",
+      startDragging: vi.fn(() => dragging.promise),
+    });
+    tauri.invoke.mockImplementation((command: string) => {
+      if (command === "get_cluster_geometry") return Promise.resolve(CLUSTER_GEOMETRY);
+      if (command === "prepare_widget_drag") return Promise.resolve(45);
+      return Promise.resolve();
+    });
+    await mountReady();
+    await act(async () => latest.enterEdit());
+    await act(async () => {
+      extraRenderers.push(create(
+        <WidgetWindowShell widgetId="music" title="Music"><div>music</div></WidgetWindowShell>,
+      ));
+    });
+    await until(() => expect(
+      extraRenderers[0]!.root.findAllByProps({ "aria-label": "Drag Music" }),
+    ).toHaveLength(1));
+
+    extraRenderers[0]!.root.findByProps({ "aria-label": "Drag Music" }).props.onPointerDown();
+    await until(() => expect(bus.listenerCount("cluster-native-drag-release")).toBe(1));
+    await bus.emit("cluster-native-drag-release", {
+      windowLabel: "widget-music",
+      dragToken: 45,
+    });
+    dragging.reject(new Error("native drag request failed"));
+
+    await until(() => expect(tauri.invoke).toHaveBeenCalledWith("cancel_widget_drag", {
+      dragToken: 45,
+    }));
+    expect(tauri.invoke.mock.calls.some(([command]) => command === "complete_widget_drag")).toBe(false);
   });
 
   it("cancels and rolls back an in-flight prepared drag when its widget root unmounts", async () => {
-    installTauriEventBus();
-    const stopMoved = vi.fn();
+    const bus = installTauriEventBus();
     tauri.getCurrentWindow.mockReturnValue({
-      onMoved: vi.fn(async () => stopMoved),
+      label: "widget-music",
       startDragging: vi.fn().mockResolvedValue(undefined),
     });
     tauri.invoke.mockImplementation((command: string) => {
@@ -832,7 +917,42 @@ describe("window cluster multi-root ownership", () => {
       ...INITIAL_LAYOUT,
       editMode: true,
     }));
-    expect(stopMoved).toHaveBeenCalledOnce();
+    expect(bus.listenerCount("cluster-native-drag-release")).toBe(0);
+  });
+
+  it("cancels a prepared drag when edit mode ends before release", async () => {
+    const bus = installTauriEventBus();
+    tauri.getCurrentWindow.mockReturnValue({
+      label: "widget-music",
+      startDragging: vi.fn().mockResolvedValue(undefined),
+    });
+    tauri.invoke.mockImplementation((command: string) => {
+      if (command === "get_cluster_geometry") return Promise.resolve(CLUSTER_GEOMETRY);
+      if (command === "prepare_widget_drag") return Promise.resolve(46);
+      return Promise.resolve();
+    });
+    await mountReady();
+    await act(async () => latest.enterEdit());
+    await act(async () => {
+      extraRenderers.push(create(
+        <WidgetWindowShell widgetId="music" title="Music"><div>music</div></WidgetWindowShell>,
+      ));
+    });
+    await until(() => expect(
+      extraRenderers[0]!.root.findAllByProps({ "aria-label": "Drag Music" }),
+    ).toHaveLength(1));
+
+    extraRenderers[0]!.root.findByProps({ "aria-label": "Drag Music" }).props.onPointerDown();
+    await until(() => expect(bus.listenerCount("cluster-native-drag-release")).toBe(1));
+    await act(async () => {
+      await bus.emit("cluster-edit-mode", false);
+    });
+
+    await until(() => expect(tauri.invoke).toHaveBeenCalledWith("cancel_widget_drag", {
+      dragToken: 46,
+    }));
+    expect(bus.listenerCount("cluster-native-drag-release")).toBe(0);
+    expect(tauri.invoke.mock.calls.some(([command]) => command === "complete_widget_drag")).toBe(false);
   });
 
   it("keeps one action bridge listener while rapid overflow and widget actions read current refs", async () => {
