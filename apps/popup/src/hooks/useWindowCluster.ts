@@ -26,6 +26,8 @@ const LAYOUT_STREAM_LIMITATION =
   "Layout synchronization is paused because the daemon event stream is disconnected; no polling fallback is used.";
 const LAYOUT_ACTION_EVENT = "cluster-layout-action";
 const LAYOUT_STATE_EVENT = "cluster-layout-state";
+const DRAG_MOVE_SETTLE_MS = 180;
+const DRAG_COMPLETION_TIMEOUT_MS = 2500;
 
 export interface EditSession {
   committed: ClusterLayoutV1;
@@ -51,7 +53,7 @@ export interface UseWindowClusterReturn {
     changes: Partial<Omit<WidgetPlacement, "widgetId">>,
   ) => Promise<void>;
   resetEdit: () => Promise<void>;
-  completeDrag: (widgetId: WidgetWindowId) => Promise<void>;
+  completeDrag: (widgetId: WidgetWindowId, dragToken: number) => Promise<void>;
   applyTutorialSelection: (widgetIds: WidgetWindowId[]) => Promise<void>;
 }
 
@@ -175,6 +177,7 @@ export function useWindowCluster(): UseWindowClusterReturn {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [degraded, setDegraded] = useState<string | null>(null);
+  const overflowCountRef = useRef(0);
   const layoutRef = useRef<ClusterLayoutV1 | null>(null);
   const committedLayoutRef = useRef<ClusterLayoutV1 | null>(null);
   const nativeLayoutRef = useRef<ClusterLayoutV1 | null>(null);
@@ -184,6 +187,7 @@ export function useWindowCluster(): UseWindowClusterReturn {
   const operationQueueRef = useRef<Promise<void>>(Promise.resolve());
   const expectedEchoesRef = useRef(new Map<string, number>());
   const actionControllersRef = useRef(new Set<AbortController>());
+  overflowCountRef.current = overflowCount;
 
   const acceptCommittedLayout = useCallback((next: ClusterLayoutV1) => {
     if (!mountedRef.current) return;
@@ -562,7 +566,41 @@ export function useWindowCluster(): UseWindowClusterReturn {
     }, "Failed to reset candidate widget layout");
   }, [acceptCandidateLayout, runAction]);
 
-  const completeDrag = useCallback(async (widgetId: WidgetWindowId) => {
+  const cyclePlacementSize = useCallback(async (widgetId: WidgetWindowId) => {
+    await runAction(async (signal) => {
+      requireActiveAction(mountedRef, signal);
+      const session = editSessionRef.current;
+      if (!session) throw new Error("Window cluster is not in edit mode");
+      const placement = session.candidate.placements.find((item) => item.widgetId === widgetId);
+      const sizes: WidgetPlacement["size"][] = ["compact", "standard", "tall", "wide"];
+      const index = placement ? sizes.indexOf(placement.size) : -1;
+      acceptCandidateLayout(updateCandidatePlacement(session.candidate, widgetId, {
+        size: sizes[(index + 1) % sizes.length] ?? "compact",
+      }));
+    }, `Failed to resize ${widgetId} widget`);
+  }, [acceptCandidateLayout, runAction]);
+
+  const restoreCommittedCandidate = useCallback(async (
+    session: EditSession,
+    signal: AbortSignal,
+  ) => {
+    const restored = { ...session.committed, editMode: true };
+    await invoke("apply_widget_layout", { layout: restored });
+    requireActiveAction(mountedRef, signal);
+    nativeLayoutRef.current = restored;
+    acceptCandidateLayout(restored);
+  }, [acceptCandidateLayout]);
+
+  const rollbackDrag = useCallback(async (widgetId: WidgetWindowId) => {
+    await runAction(async (signal) => {
+      requireActiveAction(mountedRef, signal);
+      const session = editSessionRef.current;
+      if (!session) return;
+      await restoreCommittedCandidate(session, signal);
+    }, `Failed to roll back ${widgetId} drag`);
+  }, [restoreCommittedCandidate, runAction]);
+
+  const completeDrag = useCallback(async (widgetId: WidgetWindowId, dragToken: number) => {
     await runAction(async (signal) => {
       requireActiveAction(mountedRef, signal);
       const session = editSessionRef.current;
@@ -570,14 +608,10 @@ export function useWindowCluster(): UseWindowClusterReturn {
 
       let rawSnapshot: unknown;
       try {
-        rawSnapshot = await invoke("complete_widget_drag", { widgetId });
+        rawSnapshot = await invoke("complete_widget_drag", { widgetId, dragToken });
       } catch (captureError) {
         if (actionIsActive(mountedRef, signal)) {
-          const restored = { ...session.committed, editMode: true };
-          await invoke("apply_widget_layout", { layout: restored });
-          requireActiveAction(mountedRef, signal);
-          nativeLayoutRef.current = restored;
-          acceptCandidateLayout(restored);
+          await restoreCommittedCandidate(session, signal);
         }
         throw captureError;
       }
@@ -587,24 +621,16 @@ export function useWindowCluster(): UseWindowClusterReturn {
         ? snapDraggedPlacement(session.candidate, widgetId, snapshot)
         : null;
       if (!snapshot || !snapped) {
-        const restored = { ...session.committed, editMode: true };
-        await invoke("apply_widget_layout", { layout: restored });
-        requireActiveAction(mountedRef, signal);
-        nativeLayoutRef.current = restored;
+        await restoreCommittedCandidate(session, signal);
         if (snapshot) geometryRef.current = { main: snapshot.main, output: snapshot.output };
-        acceptCandidateLayout(restored);
         return;
       }
       try {
         await invoke("apply_widget_layout", { layout: snapped });
       } catch (snapError) {
-        const restored = { ...session.committed, editMode: true };
         if (actionIsActive(mountedRef, signal)) {
-          await invoke("apply_widget_layout", { layout: restored });
-          requireActiveAction(mountedRef, signal);
-          nativeLayoutRef.current = restored;
+          await restoreCommittedCandidate(session, signal);
           geometryRef.current = { main: snapshot.main, output: snapshot.output };
-          acceptCandidateLayout(restored);
         }
         throw snapError;
       }
@@ -613,7 +639,7 @@ export function useWindowCluster(): UseWindowClusterReturn {
       geometryRef.current = { main: snapshot.main, output: snapshot.output };
       acceptCandidateLayout(snapped);
     }, `Failed to complete ${widgetId} drag`);
-  }, [acceptCandidateLayout, runAction]);
+  }, [acceptCandidateLayout, restoreCommittedCandidate, runAction]);
 
   const applyTutorialSelection = useCallback((widgetIds: WidgetWindowId[]): Promise<void> => {
     if (!mountedRef.current) {
@@ -653,6 +679,27 @@ export function useWindowCluster(): UseWindowClusterReturn {
     void emit(LAYOUT_STATE_EVENT, { layout, editSession, overflowCount });
   }, [editSession, layout, overflowCount]);
 
+  const bridgeActionsRef = useRef({
+    enterEdit,
+    commitEdit,
+    cancelEdit,
+    resetEdit,
+    updatePlacement,
+    cyclePlacementSize,
+    completeDrag,
+    rollbackDrag,
+  });
+  bridgeActionsRef.current = {
+    enterEdit,
+    commitEdit,
+    cancelEdit,
+    resetEdit,
+    updatePlacement,
+    cyclePlacementSize,
+    completeDrag,
+    rollbackDrag,
+  };
+
   useEffect(() => {
     let active = true;
     let unlisten: (() => void) | undefined;
@@ -663,38 +710,50 @@ export function useWindowCluster(): UseWindowClusterReturn {
         && OPTIONAL_WIDGET_IDS.includes(action.widgetId as WidgetWindowId)
         ? action.widgetId as WidgetWindowId
         : null;
+      const actions = bridgeActionsRef.current;
       switch (action.type) {
         case "enter":
-          void enterEdit();
+          void actions.enterEdit();
           break;
         case "commit":
-          void commitEdit();
+          void actions.commitEdit();
           break;
         case "cancel":
-          void cancelEdit();
+          void actions.cancelEdit();
           break;
         case "reset":
-          void resetEdit();
+          void actions.resetEdit();
           break;
         case "update-placement":
           if (widgetId && action.changes && typeof action.changes === "object") {
-            void updatePlacement(widgetId, action.changes as Partial<Omit<WidgetPlacement, "widgetId">>);
+            void actions.updatePlacement(
+              widgetId,
+              action.changes as Partial<Omit<WidgetPlacement, "widgetId">>,
+            );
           }
           break;
         case "cycle-size":
-          if (widgetId) {
-            const placement = editSessionRef.current?.candidate.placements
-              .find((item) => item.widgetId === widgetId);
-            const sizes: WidgetPlacement["size"][] = ["compact", "standard", "tall", "wide"];
-            const index = placement ? sizes.indexOf(placement.size) : -1;
-            void updatePlacement(widgetId, { size: sizes[(index + 1) % sizes.length] ?? "compact" });
-          }
+          if (widgetId) void actions.cyclePlacementSize(widgetId);
           break;
         case "drag-complete":
-          if (widgetId) void completeDrag(widgetId);
+          if (
+            widgetId
+            && typeof action.dragToken === "number"
+            && Number.isSafeInteger(action.dragToken)
+            && action.dragToken > 0
+          ) {
+            void actions.completeDrag(widgetId, action.dragToken);
+          }
+          break;
+        case "drag-cancelled":
+          if (widgetId) void actions.rollbackDrag(widgetId);
           break;
         case "request-state":
-          void emit(LAYOUT_STATE_EVENT, { layout: layoutRef.current, editSession: editSessionRef.current, overflowCount });
+          void emit(LAYOUT_STATE_EVENT, {
+            layout: layoutRef.current,
+            editSession: editSessionRef.current,
+            overflowCount: overflowCountRef.current,
+          });
           break;
         default:
           break;
@@ -707,7 +766,7 @@ export function useWindowCluster(): UseWindowClusterReturn {
       active = false;
       unlisten?.();
     };
-  }, [cancelEdit, commitEdit, completeDrag, enterEdit, overflowCount, resetEdit, updatePlacement]);
+  }, []);
 
   return {
     layout,
@@ -797,12 +856,64 @@ export interface UseWidgetWindowActionsReturn {
   cycleSize: (widgetId: WidgetWindowId) => Promise<void>;
 }
 
+type NativeDragWindow = Pick<ReturnType<typeof getCurrentWindow>, "onMoved" | "startDragging">;
+
+function waitForNativeMoveCompletion(window: NativeDragWindow, signal: AbortSignal) {
+  let finished = false;
+  let unlisten: (() => void) | undefined;
+  let settleTimer: ReturnType<typeof setTimeout> | undefined;
+  let timeoutTimer: ReturnType<typeof setTimeout> | undefined;
+  let resolveCompletion!: () => void;
+  let rejectCompletion!: (error: unknown) => void;
+
+  const cleanup = () => {
+    if (settleTimer !== undefined) clearTimeout(settleTimer);
+    if (timeoutTimer !== undefined) clearTimeout(timeoutTimer);
+    signal.removeEventListener("abort", abort);
+    unlisten?.();
+  };
+  const resolve = () => {
+    if (finished) return;
+    finished = true;
+    cleanup();
+    resolveCompletion();
+  };
+  const reject = (error: unknown) => {
+    if (finished) return;
+    finished = true;
+    cleanup();
+    rejectCompletion(error);
+  };
+  const abort = () => reject(new DOMException("Native window drag was cancelled", "AbortError"));
+  const completion = new Promise<void>((resolvePromise, rejectPromise) => {
+    resolveCompletion = resolvePromise;
+    rejectCompletion = rejectPromise;
+  });
+  const ready = window.onMoved(() => {
+    if (finished) return;
+    if (settleTimer !== undefined) clearTimeout(settleTimer);
+    settleTimer = setTimeout(resolve, DRAG_MOVE_SETTLE_MS);
+  }).then((stop) => {
+    if (finished) stop();
+    else unlisten = stop;
+  });
+
+  signal.addEventListener("abort", abort, { once: true });
+  timeoutTimer = setTimeout(
+    () => reject(new Error("Native window drag produced no bounded completion evidence")),
+    DRAG_COMPLETION_TIMEOUT_MS,
+  );
+  if (signal.aborted) abort();
+  return { ready, completion, cancel: abort };
+}
+
 export function useWidgetWindowActions(): UseWidgetWindowActionsReturn {
   const [editMode, setEditMode] = useState(false);
   const editModeRef = useRef(false);
   const mountedRef = useRef(false);
   const operationQueueRef = useRef<Promise<void>>(Promise.resolve());
   const actionControllersRef = useRef(new Set<AbortController>());
+  const activeDragControllerRef = useRef<AbortController | null>(null);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -810,6 +921,7 @@ export function useWidgetWindowActions(): UseWidgetWindowActionsReturn {
     let stateUnlisten: (() => void) | undefined;
     const updateEditMode = (enabled: boolean) => {
       if (!mountedRef.current) return;
+      if (!enabled) activeDragControllerRef.current?.abort();
       editModeRef.current = enabled;
       setEditMode(enabled);
     };
@@ -837,6 +949,7 @@ export function useWidgetWindowActions(): UseWidgetWindowActionsReturn {
       stateUnlisten?.();
       for (const controller of actionControllersRef.current) controller.abort();
       actionControllersRef.current.clear();
+      activeDragControllerRef.current = null;
     };
   }, []);
 
@@ -871,10 +984,37 @@ export function useWidgetWindowActions(): UseWidgetWindowActionsReturn {
   }, []);
 
   const beginDrag = useCallback(async (widgetId: WidgetWindowId) => {
-    if (!mountedRef.current || !editModeRef.current) return;
-    await getCurrentWindow().startDragging();
-    if (!mountedRef.current || !editModeRef.current) return;
-    await emit(LAYOUT_ACTION_EVENT, { type: "drag-complete", widgetId });
+    if (!mountedRef.current || !editModeRef.current || activeDragControllerRef.current) return;
+    const controller = new AbortController();
+    activeDragControllerRef.current = controller;
+    actionControllersRef.current.add(controller);
+    let dragToken: number | undefined;
+    let completion: ReturnType<typeof waitForNativeMoveCompletion> | undefined;
+    try {
+      const prepared = await invoke<number>("prepare_widget_drag", { widgetId });
+      requireActiveAction(mountedRef, controller.signal);
+      if (!Number.isSafeInteger(prepared) || prepared < 1) {
+        throw new Error("Native drag preparation returned an invalid token");
+      }
+      dragToken = prepared;
+      const window = getCurrentWindow();
+      completion = waitForNativeMoveCompletion(window, controller.signal);
+      await Promise.race([completion.ready, completion.completion]);
+      requireActiveAction(mountedRef, controller.signal);
+      await Promise.all([window.startDragging(), completion.completion]);
+      requireActiveAction(mountedRef, controller.signal);
+      await emit(LAYOUT_ACTION_EVENT, { type: "drag-complete", widgetId, dragToken });
+    } catch {
+      completion?.cancel();
+      await completion?.completion.catch(() => undefined);
+      if (dragToken !== undefined) {
+        await invoke("cancel_widget_drag", { dragToken }).catch(() => undefined);
+        await emit(LAYOUT_ACTION_EVENT, { type: "drag-cancelled", widgetId }).catch(() => undefined);
+      }
+    } finally {
+      actionControllersRef.current.delete(controller);
+      if (activeDragControllerRef.current === controller) activeDragControllerRef.current = null;
+    }
   }, []);
 
   const cycleSize = useCallback(async (widgetId: WidgetWindowId) => {

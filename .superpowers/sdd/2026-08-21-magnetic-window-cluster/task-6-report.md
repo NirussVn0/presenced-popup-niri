@@ -115,3 +115,78 @@ Tracked `tsconfig.tsbuildinfo` files changed by typecheck/build were restored. G
 **LIVE NIRI ACCEPTANCE PENDING.**
 
 No claim is made that live drag lock, visual snap animation, push, Cancel, Done, output switch, or no-overlap behavior has been accepted on a running Niri session. Those GUI checks must be performed separately against the exact committed candidate SHA. Deterministic TypeScript/component/Rust seams and all requested local gates are green.
+
+## Independent-review fix round 1
+
+Addressed all findings reported against `4eb1ba0`.
+
+### Drag completion contract and fail-closed behavior
+
+- `beginDrag` now prepares a one-use Rust drag token and validated origin snapshot before native drag begins.
+- The optional window registers Tauri `onMoved` before `startDragging`, requires actual move-event evidence followed by a 180 ms quiet settle, and imposes a 2500 ms total completion deadline.
+- Completion waits for both `startDragging()` and move-settle evidence. A deferred-start regression test was observed RED when the implementation used `Promise.race`, then GREEN after switching to `Promise.all`; `complete_widget_drag` cannot run while `startDragging` remains pending.
+- Only the main controller consumes the positive safe-integer token and requests the final Niri snapshot. Rust consumes the token exactly once, requires the exact widget/PID/title, rejects no movement, rejects main/output changes, and validates dragged/main containment within nonzero output bounds.
+- Timeout, edit cancellation, root unmount, snapshot failure, invalid geometry, no movement, and snap-apply failure all fail closed through token cancellation and committed edit-geometry rollback. Successful rollback and tutorial seen-marker failure behavior now have deterministic coverage.
+
+### Stable action bridge
+
+- The main `cluster-layout-action` listener now registers exactly once for its mount lifetime.
+- Current action callbacks and overflow state are read through stable refs; size cycling computes from candidate state inside the serialized operation queue rather than at event receipt.
+- A Tauri event-bus integration test drives overflow, settings, request-state, and rapid widget size actions across rerenders; it proves one listener registration and no lost/stale action.
+
+### Fully bounded Niri subprocess helper
+
+- `run_niri_command` now delegates to one complete bounded helper with a 1500 ms wall-clock deadline, reserved cleanup budget, nonblocking stdout/stderr draining, and independent 1 MiB byte caps.
+- Each child starts in its own process group. Timeout, output overflow, read/wait failure, or inherited held pipe handles trigger process-group `SIGKILL`, bounded direct-child reaping, and fail-closed error return; there are no reader-thread joins.
+- Rust tests exercise the complete helper for timeout, oversized stdout, oversized stderr, inherited/held pipes, direct-child kill/reap, and successful bounded JSON/stderr capture.
+
+### RED evidence for this round
+
+```text
+vitest use-window-cluster.test.tsx
+exit 1 — 2 intended failures:
+- beginDrag had no prepare/onMoved completion handshake
+- action listener registered twice after overflow change
+
+vitest -t "waits for native move completion"
+exit 1 — snapshot ran while deferred startDragging remained pending
+
+cargo test --no-run
+exit 101 — missing run_command_with_limits, validate_completed_drag, and libc
+```
+
+### Final verified gates
+
+```text
+focused TS suites
+2 files / 30 tests passed
+
+pnpm run typecheck
+passed — contracts, core, daemon, popup, web
+
+pnpm run test
+passed — 48 files / 198 tests
+
+pnpm run lint
+passed
+
+cargo test
+passed — 21 Rust tests plus doc tests
+
+cargo fmt --all -- --check
+passed
+
+cargo clippy --all-targets --all-features -- -D warnings
+passed
+
+pnpm run build
+passed — popup 2058 modules transformed
+(existing >500 kB Rollup chunk warning only)
+
+git diff --check
+passed
+```
+
+Tracked `tsconfig.tsbuildinfo` artifacts were restored after the final build. Added-line security scan found no hardcoded-secret, shell-injection, eval/exec, or unsafe-deserialization matches. Independent OpenCode follow-up review returned **PASS** with no Critical/Important issue remaining in drag ordering, listener lifetime/current-state access, or subprocess bounds.
+
+**LIVE NIRI ACCEPTANCE REMAINS PENDING.** No live-runtime claim is added in this fix round; exact-build GUI acceptance remains required after commit.

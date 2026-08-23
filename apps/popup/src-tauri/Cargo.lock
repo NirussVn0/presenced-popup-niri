@@ -2358,6 +2358,7 @@ checksum = "925383efa346730478fb4838dbe9137d2a47675ad789c546d150a6e1dd4ab31c"
 name = "presenced-popup"
 version = "0.6.0"
 dependencies = [
+ "libc",
  "serde",
  "serde_json",
  "tauri",

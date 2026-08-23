@@ -106,6 +106,28 @@ function deferred<T>() {
   return { promise, resolve, reject };
 }
 
+type TauriEventHandler = (event: { payload: unknown }) => void;
+
+function installTauriEventBus() {
+  const listeners = new Map<string, Set<TauriEventHandler>>();
+  tauri.listen.mockImplementation(async (eventName: string, handler: TauriEventHandler) => {
+    const handlers = listeners.get(eventName) ?? new Set<TauriEventHandler>();
+    handlers.add(handler);
+    listeners.set(eventName, handlers);
+    return () => handlers.delete(handler);
+  });
+  tauri.emit.mockImplementation(async (eventName: string, payload: unknown) => {
+    for (const handler of [...(listeners.get(eventName) ?? [])]) handler({ payload });
+  });
+  return {
+    emit: async (eventName: string, payload: unknown) => {
+      for (const handler of [...(listeners.get(eventName) ?? [])]) handler({ payload });
+      await flush();
+    },
+    listenerCount: (eventName: string) => listeners.get(eventName)?.size ?? 0,
+  };
+}
+
 let latest: UseWindowClusterReturn;
 let renderer: ReactTestRenderer | null;
 let extraRenderers: ReactTestRenderer[];
@@ -185,6 +207,7 @@ afterEach(async () => {
       for (const extraRenderer of extraRenderers) extraRenderer.unmount();
     });
   }
+  vi.useRealTimers();
   vi.unstubAllGlobals();
 });
 
@@ -537,7 +560,7 @@ describe("useWindowCluster ordered mutations", () => {
     tauri.invoke.mockClear();
     (fetch as ReturnType<typeof vi.fn>).mockClear();
 
-    await act(async () => latest.completeDrag("rvc"));
+    await act(async () => latest.completeDrag("rvc", 11));
 
     expect(latest.editSession?.candidate.placements.filter((placement) => placement.side === "left"))
       .toEqual([
@@ -546,7 +569,10 @@ describe("useWindowCluster ordered mutations", () => {
         expect.objectContaining({ widgetId: "system", order: 2 }),
       ]);
     expect(fetch).not.toHaveBeenCalled();
-    expect(tauri.invoke.mock.calls[0]).toEqual(["complete_widget_drag", { widgetId: "rvc" }]);
+    expect(tauri.invoke.mock.calls[0]).toEqual([
+      "complete_widget_drag",
+      { widgetId: "rvc", dragToken: 11 },
+    ]);
     expect(tauri.invoke.mock.calls[1]).toEqual([
       "apply_widget_layout",
       { layout: latest.editSession?.candidate },
@@ -571,14 +597,45 @@ describe("useWindowCluster ordered mutations", () => {
     tauri.invoke.mockClear();
     (fetch as ReturnType<typeof vi.fn>).mockClear();
 
-    await act(async () => latest.completeDrag("music"));
+    await act(async () => latest.completeDrag("music", 12));
 
     expect(fetch).not.toHaveBeenCalled();
     expect(tauri.invoke.mock.calls).toEqual([
-      ["complete_widget_drag", { widgetId: "music" }],
+      ["complete_widget_drag", { widgetId: "music", dragToken: 12 }],
       ["apply_widget_layout", { layout: { ...INITIAL_LAYOUT, editMode: true } }],
     ]);
     expect(latest.editSession?.candidate).toEqual({ ...INITIAL_LAYOUT, editMode: true });
+  });
+
+  it("restores committed edit geometry when applying a valid snapped candidate fails", async () => {
+    const applied: ClusterLayoutV1[] = [];
+    tauri.invoke.mockImplementation((command: string, args?: unknown) => {
+      if (command === "get_cluster_geometry") return Promise.resolve(CLUSTER_GEOMETRY);
+      if (command === "complete_widget_drag") {
+        return Promise.resolve({
+          dragged: { x: 1335, y: 334, width: 250, height: 190 },
+          main: CLUSTER_GEOMETRY.main,
+          output: CLUSTER_GEOMETRY.output,
+        });
+      }
+      if (command === "apply_widget_layout") {
+        const layout = (args as { layout: ClusterLayoutV1 }).layout;
+        applied.push(layout);
+        if (applied.length === 1) return Promise.reject(new Error("snap apply failed"));
+      }
+      return Promise.resolve();
+    });
+    await mountReady();
+    await act(async () => latest.enterEdit());
+    tauri.invoke.mockClear();
+
+    await act(async () => latest.completeDrag("music", 13));
+
+    expect(applied).toHaveLength(2);
+    expect(applied[0]?.placements[0]).toMatchObject({ widgetId: "music", side: "right" });
+    expect(applied[1]).toEqual({ ...INITIAL_LAYOUT, editMode: true });
+    expect(latest.editSession?.candidate).toEqual({ ...INITIAL_LAYOUT, editMode: true });
+    expect(latest.error).toContain("snap apply failed");
   });
 
   it("retains known geometry after a drag snapshot failure restores committed placement", async () => {
@@ -597,7 +654,7 @@ describe("useWindowCluster ordered mutations", () => {
     await mountReady();
     await act(async () => latest.enterEdit());
 
-    await act(async () => latest.completeDrag("music"));
+    await act(async () => latest.completeDrag("music", 14));
     await act(async () => latest.updatePlacement("system", {
       side: "left",
       order: 1,
@@ -610,6 +667,213 @@ describe("useWindowCluster ordered mutations", () => {
 });
 
 describe("window cluster multi-root ownership", () => {
+  it("waits for native move completion evidence before the beginDrag path can snapshot", async () => {
+    const bus = installTauriEventBus();
+    const calls: string[] = [];
+    let movedHandler: (() => void) | undefined;
+    const stopMoved = vi.fn();
+    const dragging = deferred<void>();
+    tauri.getCurrentWindow.mockReturnValue({
+      onMoved: vi.fn(async (handler: () => void) => {
+        calls.push("listen-moved");
+        movedHandler = handler;
+        return stopMoved;
+      }),
+      startDragging: vi.fn(async () => {
+        calls.push("start-dragging");
+        await dragging.promise;
+      }),
+    });
+    tauri.invoke.mockImplementation((command: string) => {
+      calls.push(command);
+      if (command === "get_cluster_geometry") return Promise.resolve(CLUSTER_GEOMETRY);
+      if (command === "prepare_widget_drag") return Promise.resolve(41);
+      if (command === "complete_widget_drag") {
+        return Promise.resolve({
+          dragged: { x: 345, y: 334, width: 250, height: 190 },
+          main: CLUSTER_GEOMETRY.main,
+          output: CLUSTER_GEOMETRY.output,
+        });
+      }
+      return Promise.resolve();
+    });
+    await mountReady();
+    await act(async () => latest.enterEdit());
+    await act(async () => {
+      extraRenderers.push(create(
+        <WidgetWindowShell widgetId="music" title="Music"><div>music</div></WidgetWindowShell>,
+      ));
+    });
+    await until(() => expect(
+      extraRenderers[0]!.root.findAllByProps({ "aria-label": "Drag Music" }),
+    ).toHaveLength(1));
+
+    vi.useFakeTimers();
+    const drag = extraRenderers[0]!.root.findByProps({ "aria-label": "Drag Music" });
+    await act(async () => {
+      drag.props.onPointerDown();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(calls.indexOf("prepare_widget_drag")).toBeLessThan(calls.indexOf("listen-moved"));
+    expect(calls.indexOf("listen-moved")).toBeLessThan(calls.indexOf("start-dragging"));
+    expect(calls).not.toContain("complete_widget_drag");
+
+    await act(async () => {
+      movedHandler?.();
+      await vi.advanceTimersByTimeAsync(100);
+    });
+    expect(calls).not.toContain("complete_widget_drag");
+
+    await act(async () => {
+      await vi.runAllTimersAsync();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(calls).not.toContain("complete_widget_drag");
+
+    await act(async () => {
+      dragging.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    await until(() => expect(calls).toContain("complete_widget_drag"));
+    expect(calls.indexOf("start-dragging")).toBeLessThan(calls.indexOf("complete_widget_drag"));
+    expect(stopMoved).toHaveBeenCalledOnce();
+    expect(bus.listenerCount("cluster-layout-action")).toBe(1);
+  });
+
+  it("times out a beginDrag with no move evidence, cancels its token, and rolls back", async () => {
+    installTauriEventBus();
+    const stopMoved = vi.fn();
+    tauri.getCurrentWindow.mockReturnValue({
+      onMoved: vi.fn(async () => stopMoved),
+      startDragging: vi.fn().mockResolvedValue(undefined),
+    });
+    tauri.invoke.mockImplementation((command: string) => {
+      if (command === "get_cluster_geometry") return Promise.resolve(CLUSTER_GEOMETRY);
+      if (command === "prepare_widget_drag") return Promise.resolve(42);
+      return Promise.resolve();
+    });
+    await mountReady();
+    await act(async () => latest.enterEdit());
+    await act(async () => latest.updatePlacement("music", { size: "wide" }));
+    await act(async () => {
+      extraRenderers.push(create(
+        <WidgetWindowShell widgetId="music" title="Music"><div>music</div></WidgetWindowShell>,
+      ));
+    });
+    await until(() => expect(
+      extraRenderers[0]!.root.findAllByProps({ "aria-label": "Drag Music" }),
+    ).toHaveLength(1));
+
+    vi.useFakeTimers();
+    const drag = extraRenderers[0]!.root.findByProps({ "aria-label": "Drag Music" });
+    await act(async () => {
+      drag.props.onPointerDown();
+      await Promise.resolve();
+      await Promise.resolve();
+      await vi.runAllTimersAsync();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    await until(() => expect(tauri.invoke).toHaveBeenCalledWith("cancel_widget_drag", {
+      dragToken: 42,
+    }));
+    await until(() => expect(latest.editSession?.candidate).toEqual({
+      ...INITIAL_LAYOUT,
+      editMode: true,
+    }));
+
+    expect(tauri.invoke.mock.calls.some(([command]) => command === "complete_widget_drag")).toBe(false);
+    expect(tauri.invoke).toHaveBeenCalledWith("apply_widget_layout", {
+      layout: { ...INITIAL_LAYOUT, editMode: true },
+    });
+    expect(stopMoved).toHaveBeenCalledOnce();
+  });
+
+  it("cancels and rolls back an in-flight prepared drag when its widget root unmounts", async () => {
+    installTauriEventBus();
+    const stopMoved = vi.fn();
+    tauri.getCurrentWindow.mockReturnValue({
+      onMoved: vi.fn(async () => stopMoved),
+      startDragging: vi.fn().mockResolvedValue(undefined),
+    });
+    tauri.invoke.mockImplementation((command: string) => {
+      if (command === "get_cluster_geometry") return Promise.resolve(CLUSTER_GEOMETRY);
+      if (command === "prepare_widget_drag") return Promise.resolve(43);
+      return Promise.resolve();
+    });
+    await mountReady();
+    await act(async () => latest.enterEdit());
+    await act(async () => latest.updatePlacement("music", { size: "wide" }));
+    let shell!: ReactTestRenderer;
+    await act(async () => {
+      shell = create(
+        <WidgetWindowShell widgetId="music" title="Music"><div>music</div></WidgetWindowShell>,
+      );
+      extraRenderers.push(shell);
+    });
+    await until(() => expect(shell.root.findAllByProps({ "aria-label": "Drag Music" })).toHaveLength(1));
+
+    await act(async () => {
+      shell.root.findByProps({ "aria-label": "Drag Music" }).props.onPointerDown();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    await act(async () => shell.unmount());
+    extraRenderers = [];
+
+    await until(() => expect(tauri.invoke).toHaveBeenCalledWith("cancel_widget_drag", {
+      dragToken: 43,
+    }));
+    await until(() => expect(latest.editSession?.candidate).toEqual({
+      ...INITIAL_LAYOUT,
+      editMode: true,
+    }));
+    expect(stopMoved).toHaveBeenCalledOnce();
+  });
+
+  it("keeps one action bridge listener while rapid overflow and widget actions read current refs", async () => {
+    const bus = installTauriEventBus();
+    tauri.invoke.mockImplementation((command: string) => command === "get_cluster_geometry"
+      ? Promise.resolve({
+        main: { x: 400, y: 40, width: 300, height: 420 },
+        output: { x: 0, y: 0, width: 800, height: 600 },
+      })
+      : Promise.resolve());
+    await mountReady();
+    expect(bus.listenerCount("cluster-layout-action")).toBe(1);
+
+    await bus.emit("cluster-layout-action", { type: "enter" });
+    await until(() => expect(latest.editSession).not.toBeNull());
+    await bus.emit("cluster-layout-action", {
+      type: "update-placement",
+      widgetId: "system",
+      changes: { side: "left", order: 1, size: "standard", visible: true },
+    });
+    await until(() => expect(latest.overflowCount).toBe(1));
+
+    await bus.emit("cluster-layout-action", {
+      type: "update-placement",
+      widgetId: "music",
+      changes: { size: "tall" },
+    });
+    await bus.emit("cluster-layout-action", { type: "cycle-size", widgetId: "music" });
+    await bus.emit("cluster-layout-action", { type: "request-state" });
+    await until(() => expect(
+      latest.editSession?.candidate.placements.find((item) => item.widgetId === "music")?.size,
+    ).toBe("wide"));
+
+    expect(bus.listenerCount("cluster-layout-action")).toBe(1);
+    expect(tauri.listen.mock.calls.filter(([eventName]) => eventName === "cluster-layout-action"))
+      .toHaveLength(1);
+    expect(tauri.emit).toHaveBeenCalledWith("cluster-layout-state", expect.objectContaining({
+      overflowCount: 1,
+    }));
+  });
+
   it("keeps optional shells lightweight and applies their persisted hide once in the main controller", async () => {
     const socket = await mountReady();
 

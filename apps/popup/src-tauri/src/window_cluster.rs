@@ -7,7 +7,9 @@ use std::{
 #[cfg(target_os = "linux")]
 use std::{
     io::Read,
-    process::{Child, Command, ExitStatus, Stdio},
+    os::fd::AsRawFd,
+    os::unix::process::CommandExt,
+    process::{Child, ChildStderr, ChildStdout, Command, ExitStatus, Stdio},
     thread,
     time::{Duration, Instant},
 };
@@ -29,6 +31,10 @@ const OPENING_SETTLE_DELAY: Duration = Duration::from_millis(1000);
 const CENTER_RETRY_DELAY: Duration = Duration::from_millis(500);
 #[cfg(target_os = "linux")]
 const NIRI_EXEC_TIMEOUT: Duration = Duration::from_millis(1500);
+#[cfg(target_os = "linux")]
+const NIRI_OUTPUT_LIMIT: usize = 1024 * 1024;
+#[cfg(target_os = "linux")]
+const PROCESS_CLEANUP_RESERVE: Duration = Duration::from_millis(100);
 #[cfg(target_os = "linux")]
 const PROCESS_POLL_DELAY: Duration = Duration::from_millis(5);
 #[cfg(target_os = "linux")]
@@ -597,10 +603,11 @@ fn cluster_geometry_from_payload(
     }
     find_niri_windows(payload, pid)?;
     let windows = parse_niri_windows(payload)?;
-    Ok(ClusterGeometryPayload {
-        main: niri_window_rect(&windows, pid, WindowLabel::Main)?,
-        output,
-    })
+    let main = niri_window_rect(&windows, pid, WindowLabel::Main)?;
+    if rect_outside(main, output) {
+        return Err("widget-main Niri rectangle is outside the output".to_owned());
+    }
+    Ok(ClusterGeometryPayload { main, output })
 }
 
 fn drag_snapshot_from_payload(
@@ -614,11 +621,35 @@ fn drag_snapshot_from_payload(
     }
     find_niri_windows(payload, pid)?;
     let windows = parse_niri_windows(payload)?;
+    let dragged = niri_window_rect(&windows, pid, widget_id.window_label())?;
+    let main = niri_window_rect(&windows, pid, WindowLabel::Main)?;
+    if rect_outside(dragged, output) {
+        return Err("dragged widget Niri rectangle is outside the output".to_owned());
+    }
+    if rect_outside(main, output) {
+        return Err("widget-main Niri rectangle is outside the output".to_owned());
+    }
     Ok(DragSnapshotPayload {
-        dragged: niri_window_rect(&windows, pid, widget_id.window_label())?,
-        main: niri_window_rect(&windows, pid, WindowLabel::Main)?,
+        dragged,
+        main,
         output,
     })
+}
+
+fn validate_completed_drag(
+    origin: DragSnapshotPayload,
+    completed: DragSnapshotPayload,
+) -> Result<DragSnapshotPayload, String> {
+    if completed.dragged == origin.dragged {
+        return Err("native drag completed without moving the widget".to_owned());
+    }
+    if completed.main != origin.main {
+        return Err("main window geometry changed during widget drag".to_owned());
+    }
+    if completed.output != origin.output {
+        return Err("cluster output changed during widget drag".to_owned());
+    }
+    Ok(completed)
 }
 
 fn find_niri_windows(payload: &[u8], pid: u32) -> Result<HashMap<String, u64>, String> {
@@ -674,9 +705,17 @@ impl ApplyGenerationTracker {
     }
 }
 
+#[derive(Clone, Copy)]
+struct PreparedDrag {
+    widget_id: WidgetId,
+    origin: DragSnapshotPayload,
+}
+
 struct ControllerData {
     generations: ApplyGenerationTracker,
     layout: Option<ValidatedClusterLayout>,
+    next_drag_token: u64,
+    prepared_drags: HashMap<u64, PreparedDrag>,
 }
 
 pub(crate) struct WindowClusterController {
@@ -707,6 +746,8 @@ pub(crate) fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Erro
         data: StdMutex::new(ControllerData {
             generations: ApplyGenerationTracker::default(),
             layout: None,
+            next_drag_token: 0,
+            prepared_drags: HashMap::new(),
         }),
         apply_lock: AsyncMutex::new(()),
     });
@@ -939,6 +980,9 @@ async fn apply_validated_layout(
         return Ok(());
     }
     debug_assert_eq!(applied.visible_widget_ids, visible_widget_ids);
+    if !layout.edit_mode {
+        data.prepared_drags.clear();
+    }
     data.layout = Some(layout);
     Ok(())
 }
@@ -1015,6 +1059,9 @@ pub(crate) async fn set_cluster_edit_mode(
         .ok_or_else(|| "window cluster is not initialized".to_owned())?;
     emit_edit_mode(&state.app, enabled)?;
     layout.edit_mode = enabled;
+    if !enabled {
+        data.prepared_drags.clear();
+    }
     Ok(())
 }
 
@@ -1048,32 +1095,114 @@ pub(crate) fn hide_widget_window(
     Ok(())
 }
 
+fn validate_drag_layout(
+    layout: Option<&ValidatedClusterLayout>,
+    widget_id: WidgetId,
+) -> Result<(), String> {
+    let layout = layout.ok_or_else(|| "window cluster is not initialized".to_owned())?;
+    if !layout.edit_mode {
+        return Err("window cluster is not in edit mode".to_owned());
+    }
+    if !layout
+        .placements
+        .iter()
+        .any(|placement| placement.widget_id == widget_id && placement.visible)
+    {
+        return Err("dragged widget has no visible placement".to_owned());
+    }
+    Ok(())
+}
+
 #[tauri::command]
-pub(crate) async fn complete_widget_drag(
+pub(crate) async fn prepare_widget_drag(
     state: State<'_, WindowClusterController>,
     widget_id: String,
-) -> Result<DragSnapshotPayload, String> {
+) -> Result<u64, String> {
     let widget_id = WidgetId::from_str(&widget_id)?;
     {
         let data = state
             .data
             .lock()
             .map_err(|_| "window cluster state is unavailable".to_owned())?;
-        let layout = data
-            .layout
-            .as_ref()
-            .ok_or_else(|| "window cluster is not initialized".to_owned())?;
-        if !layout.edit_mode {
-            return Err("window cluster is not in edit mode".to_owned());
-        }
-        if !layout
-            .placements
-            .iter()
-            .any(|placement| placement.widget_id == widget_id && placement.visible)
-        {
-            return Err("dragged widget has no visible placement".to_owned());
-        }
+        validate_drag_layout(data.layout.as_ref(), widget_id)?;
     }
+    let output = current_output_rect(&state.app)?;
+
+    #[cfg(target_os = "linux")]
+    let origin = {
+        let pid = state.pid;
+        tauri::async_runtime::spawn_blocking(move || {
+            let snapshot = run_niri_command(&["msg", "--json", "windows"])?;
+            if !snapshot.success {
+                return Err(format!(
+                    "Niri windows command failed: {}",
+                    String::from_utf8_lossy(&snapshot.stderr)
+                ));
+            }
+            drag_snapshot_from_payload(&snapshot.stdout, pid, widget_id, output)
+        })
+        .await
+        .map_err(|error| format!("Niri drag preparation worker failed: {error}"))??
+    };
+
+    #[cfg(not(target_os = "linux"))]
+    let origin = {
+        let _ = output;
+        return Err("Niri drag preparation is only available on Linux".to_owned());
+    };
+
+    let mut data = state
+        .data
+        .lock()
+        .map_err(|_| "window cluster state is unavailable".to_owned())?;
+    validate_drag_layout(data.layout.as_ref(), widget_id)?;
+    data.next_drag_token = data
+        .next_drag_token
+        .checked_add(1)
+        .ok_or_else(|| "native drag token space was exhausted".to_owned())?;
+    let token = data.next_drag_token;
+    data.prepared_drags
+        .retain(|_, prepared| prepared.widget_id != widget_id);
+    data.prepared_drags
+        .insert(token, PreparedDrag { widget_id, origin });
+    Ok(token)
+}
+
+#[tauri::command]
+pub(crate) fn cancel_widget_drag(
+    state: State<'_, WindowClusterController>,
+    drag_token: u64,
+) -> Result<(), String> {
+    state
+        .data
+        .lock()
+        .map_err(|_| "window cluster state is unavailable".to_owned())?
+        .prepared_drags
+        .remove(&drag_token);
+    Ok(())
+}
+
+#[tauri::command]
+pub(crate) async fn complete_widget_drag(
+    state: State<'_, WindowClusterController>,
+    widget_id: String,
+    drag_token: u64,
+) -> Result<DragSnapshotPayload, String> {
+    let widget_id = WidgetId::from_str(&widget_id)?;
+    let prepared = {
+        let mut data = state
+            .data
+            .lock()
+            .map_err(|_| "window cluster state is unavailable".to_owned())?;
+        validate_drag_layout(data.layout.as_ref(), widget_id)?;
+        let prepared = data.prepared_drags.remove(&drag_token).ok_or_else(|| {
+            "native drag token is missing, expired, or already consumed".to_owned()
+        })?;
+        if prepared.widget_id != widget_id {
+            return Err("native drag token belongs to a different widget".to_owned());
+        }
+        prepared
+    };
     let output = current_output_rect(&state.app)?;
 
     #[cfg(target_os = "linux")]
@@ -1082,9 +1211,13 @@ pub(crate) async fn complete_widget_drag(
         tauri::async_runtime::spawn_blocking(move || {
             let snapshot = run_niri_command(&["msg", "--json", "windows"])?;
             if !snapshot.success {
-                return Err("Niri windows command failed".to_owned());
+                return Err(format!(
+                    "Niri windows command failed: {}",
+                    String::from_utf8_lossy(&snapshot.stderr)
+                ));
             }
-            drag_snapshot_from_payload(&snapshot.stdout, pid, widget_id, output)
+            let completed = drag_snapshot_from_payload(&snapshot.stdout, pid, widget_id, output)?;
+            validate_completed_drag(prepared.origin, completed)
         })
         .await
         .map_err(|error| format!("Niri drag snapshot worker failed: {error}"))?
@@ -1092,7 +1225,7 @@ pub(crate) async fn complete_widget_drag(
 
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (widget_id, output);
+        let _ = (widget_id, output, prepared);
         Err("Niri drag completion is only available on Linux".to_owned())
     }
 }
@@ -1125,82 +1258,204 @@ pub(crate) async fn get_cluster_geometry(
 }
 
 #[cfg(target_os = "linux")]
-fn wait_for_child_with_timeout(child: &mut Child, timeout: Duration) -> Result<ExitStatus, String> {
-    let started = Instant::now();
+#[derive(Debug)]
+struct NiriCommandOutput {
+    success: bool,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+#[cfg(target_os = "linux")]
+fn set_nonblocking<T: AsRawFd>(pipe: &T) -> Result<(), String> {
+    let descriptor = pipe.as_raw_fd();
+    let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(format!(
+            "failed to read command pipe flags: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    if unsafe { libc::fcntl(descriptor, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(format!(
+            "failed to bound command pipe reads: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn drain_pipe<R: Read>(
+    pipe: &mut R,
+    output: &mut Vec<u8>,
+    output_limit: usize,
+    stream_name: &str,
+) -> Result<bool, String> {
+    let mut chunk = [0_u8; 8192];
     loop {
-        match child.try_wait() {
-            Ok(Some(status)) => return Ok(status),
-            Ok(None) if started.elapsed() < timeout => thread::sleep(PROCESS_POLL_DELAY),
-            Ok(None) => {
-                let _ = child.kill();
-                child
-                    .wait()
-                    .map_err(|error| format!("failed to reap timed-out Niri command: {error}"))?;
-                return Err("Niri command timed out".to_owned());
+        match pipe.read(&mut chunk) {
+            Ok(0) => return Ok(true),
+            Ok(read) => {
+                if read > output_limit.saturating_sub(output.len()) {
+                    return Err(format!("{stream_name} exceeded the command output limit"));
+                }
+                output.extend_from_slice(&chunk[..read]);
             }
-            Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(format!("failed while waiting for Niri command: {error}"));
-            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(false),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(format!("failed to read command {stream_name}: {error}")),
         }
     }
 }
 
 #[cfg(target_os = "linux")]
-struct NiriCommandOutput {
-    success: bool,
-    stdout: Vec<u8>,
+fn terminate_process_group(child: &mut Child) {
+    let process_group = i32::try_from(child.id()).unwrap_or(i32::MAX);
+    unsafe {
+        libc::kill(-process_group, libc::SIGKILL);
+    }
+    let _ = child.kill();
+}
+
+#[cfg(target_os = "linux")]
+fn reap_until(child: &mut Child, deadline: Instant) -> Result<ExitStatus, String> {
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) if Instant::now() < deadline => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                thread::sleep(PROCESS_POLL_DELAY.min(remaining));
+            }
+            Ok(None) => {
+                return Err("command cleanup deadline elapsed before child reaping".to_owned())
+            }
+            Err(error) => return Err(format!("failed while reaping command: {error}")),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn run_command_with_limits(
+    program: &str,
+    arguments: &[&str],
+    timeout: Duration,
+    output_limit: usize,
+) -> Result<NiriCommandOutput, String> {
+    if timeout.is_zero() || output_limit == 0 {
+        return Err("command bounds must be positive".to_owned());
+    }
+    let started = Instant::now();
+    let deadline = started + timeout;
+    let cleanup_reserve = PROCESS_CLEANUP_RESERVE.min(timeout / 2);
+    let execution_deadline = deadline - cleanup_reserve;
+    let mut child = Command::new(program)
+        .args(arguments)
+        .process_group(0)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("could not start bounded command {program}: {error}"))?;
+    let mut stdout: ChildStdout = child.stdout.take().ok_or_else(|| {
+        terminate_process_group(&mut child);
+        let _ = reap_until(&mut child, deadline);
+        "command stdout was unavailable".to_owned()
+    })?;
+    let mut stderr: ChildStderr = child.stderr.take().ok_or_else(|| {
+        terminate_process_group(&mut child);
+        let _ = reap_until(&mut child, deadline);
+        "command stderr was unavailable".to_owned()
+    })?;
+    if let Err(error) = set_nonblocking(&stdout).and_then(|()| set_nonblocking(&stderr)) {
+        terminate_process_group(&mut child);
+        reap_until(&mut child, deadline)?;
+        return Err(error);
+    }
+
+    let mut stdout_bytes = Vec::new();
+    let mut stderr_bytes = Vec::new();
+    let mut stdout_eof = false;
+    let mut stderr_eof = false;
+    let mut status = None;
+    let mut failure: Option<String> = None;
+    let mut terminated = false;
+
+    loop {
+        if !stdout_eof {
+            match drain_pipe(&mut stdout, &mut stdout_bytes, output_limit, "stdout") {
+                Ok(eof) => stdout_eof = eof,
+                Err(error) => {
+                    failure.get_or_insert(error);
+                }
+            };
+        }
+        if !stderr_eof {
+            match drain_pipe(&mut stderr, &mut stderr_bytes, output_limit, "stderr") {
+                Ok(eof) => stderr_eof = eof,
+                Err(error) => {
+                    failure.get_or_insert(error);
+                }
+            };
+        }
+        if status.is_none() {
+            match child.try_wait() {
+                Ok(next) => status = next,
+                Err(error) => {
+                    failure.get_or_insert_with(|| {
+                        format!("failed while waiting for bounded command: {error}")
+                    });
+                }
+            }
+        }
+
+        if stdout_eof && stderr_eof {
+            if let Some(completed_status) = status {
+                if let Some(error) = failure {
+                    return Err(error);
+                }
+                return Ok(NiriCommandOutput {
+                    success: completed_status.success(),
+                    stdout: stdout_bytes,
+                    stderr: stderr_bytes,
+                });
+            }
+        }
+
+        let now = Instant::now();
+        if failure.is_none() && now >= execution_deadline {
+            failure = Some(if status.is_some() {
+                "command descendants held output pipes beyond the deadline".to_owned()
+            } else {
+                "command timed out".to_owned()
+            });
+        }
+        if failure.is_some() && !terminated {
+            terminate_process_group(&mut child);
+            terminated = true;
+        }
+        if now >= deadline {
+            if status.is_none() {
+                return match reap_until(&mut child, deadline) {
+                    Ok(_) => Err(failure.unwrap_or_else(|| {
+                        "bounded command exceeded its wall-clock deadline".to_owned()
+                    })),
+                    Err(cleanup_error) => Err(format!(
+                        "{}; {cleanup_error}",
+                        failure.unwrap_or_else(|| "bounded command did not complete".to_owned())
+                    )),
+                };
+            }
+            return Err(failure.unwrap_or_else(|| {
+                "command output pipes did not close within the wall-clock bound".to_owned()
+            }));
+        }
+        let remaining = deadline.saturating_duration_since(now);
+        thread::sleep(PROCESS_POLL_DELAY.min(remaining));
+    }
 }
 
 #[cfg(target_os = "linux")]
 fn run_niri_command(arguments: &[&str]) -> Result<NiriCommandOutput, String> {
-    let mut child = Command::new("niri")
-        .args(arguments)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| format!("could not start Niri command: {error}"))?;
-    let mut stdout = match child.stdout.take() {
-        Some(stdout) => stdout,
-        None => {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err("Niri stdout was unavailable".to_owned());
-        }
-    };
-    let mut stderr = match child.stderr.take() {
-        Some(stderr) => stderr,
-        None => {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err("Niri stderr was unavailable".to_owned());
-        }
-    };
-    let stdout_reader = thread::spawn(move || {
-        let mut bytes = Vec::new();
-        stdout.read_to_end(&mut bytes).map(|_| bytes)
-    });
-    let stderr_reader = thread::spawn(move || {
-        let mut bytes = Vec::new();
-        stderr.read_to_end(&mut bytes).map(|_| bytes)
-    });
-
-    let status = wait_for_child_with_timeout(&mut child, NIRI_EXEC_TIMEOUT);
-    let stdout = stdout_reader
-        .join()
-        .map_err(|_| "Niri stdout reader failed".to_owned())?
-        .map_err(|error| format!("failed to read Niri stdout: {error}"))?;
-    stderr_reader
-        .join()
-        .map_err(|_| "Niri stderr reader failed".to_owned())?
-        .map_err(|error| format!("failed to read Niri stderr: {error}"))?;
-    let status = status?;
-
-    Ok(NiriCommandOutput {
-        success: status.success(),
-        stdout,
-    })
+    run_command_with_limits("niri", arguments, NIRI_EXEC_TIMEOUT, NIRI_OUTPUT_LIMIT)
 }
 
 #[cfg(target_os = "linux")]
@@ -1357,15 +1612,15 @@ async fn reapply_niri_layout(
 mod tests {
     use super::{
         close_disposition, cluster_geometry_from_payload, committed_visibility,
-        drag_snapshot_from_payload, find_niri_windows, project_layout, validate_layout,
-        visible_projected_widget_ids, wait_for_child_with_timeout, AppliedNiriLayout,
+        drag_snapshot_from_payload, find_niri_windows, project_layout, run_command_with_limits,
+        validate_completed_drag, validate_layout, visible_projected_widget_ids, AppliedNiriLayout,
         ApplyGenerationTracker, CloseDisposition, ClusterLayoutV1Payload, Lane, Rect, Side,
         SizePreset, WidgetId, WidgetPlacementPayload, WindowLabel, WINDOW_REGISTRY,
     };
     use std::{
         collections::HashSet,
-        process::Command,
-        time::{Duration, Instant},
+        fs,
+        time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     };
 
     fn placement() -> WidgetPlacementPayload {
@@ -1409,18 +1664,79 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn timed_out_child_is_killed_and_reaped() {
-        let mut child = Command::new("sh")
-            .args(["-c", "exec sleep 5"])
-            .spawn()
-            .unwrap();
+    fn complete_command_helper_times_out_kills_and_reaps() {
+        let pid_file = std::env::temp_dir().join(format!(
+            "presenced-niri-helper-{}-{}.pid",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let script = format!("printf '%s' $$ > {}; exec sleep 5", pid_file.display());
         let started = Instant::now();
 
-        let result = wait_for_child_with_timeout(&mut child, Duration::from_millis(50));
+        let result =
+            run_command_with_limits("sh", &["-c", &script], Duration::from_millis(120), 1024);
 
         assert!(result.is_err());
         assert!(started.elapsed() < Duration::from_secs(1));
-        assert!(child.try_wait().unwrap().is_some());
+        let pid: i32 = fs::read_to_string(&pid_file).unwrap().parse().unwrap();
+        let probe = unsafe { libc::kill(pid, 0) };
+        assert_eq!(
+            probe, -1,
+            "timed-out direct child must be killed and reaped"
+        );
+        let _ = fs::remove_file(pid_file);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn complete_command_helper_caps_stdout_and_stderr() {
+        for script in [
+            "dd if=/dev/zero bs=4096 count=1 2>/dev/null",
+            "dd if=/dev/zero bs=4096 count=1 1>&2 2>/dev/null",
+        ] {
+            let started = Instant::now();
+            let result =
+                run_command_with_limits("sh", &["-c", script], Duration::from_millis(500), 1024);
+            assert!(result.unwrap_err().contains("output limit"));
+            assert!(started.elapsed() < Duration::from_secs(1));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn complete_command_helper_bounds_inherited_held_pipe_handles() {
+        let started = Instant::now();
+        let result = run_command_with_limits(
+            "sh",
+            &["-c", "sleep 5 & printf '{}'"],
+            Duration::from_millis(120),
+            1024,
+        );
+
+        assert!(result.is_err());
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn complete_command_helper_returns_successful_bounded_json_and_stderr() {
+        let output = run_command_with_limits(
+            "sh",
+            &["-c", "printf '{\"ok\":true}'; printf warning >&2"],
+            Duration::from_millis(500),
+            1024,
+        )
+        .unwrap();
+
+        assert!(output.success);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),
+            serde_json::json!({"ok": true})
+        );
+        assert_eq!(output.stderr, b"warning");
     }
 
     #[test]
@@ -1548,6 +1864,76 @@ mod tests {
           {"id": 12, "pid": 55, "title": "presenced:widget-rvc", "layout": {"tile_pos_in_workspace_view": [345.0, 334.0], "window_size": [0, 190]}}
         ]"#;
         assert!(drag_snapshot_from_payload(zero_sized, 55, WidgetId::Rvc, output).is_err());
+
+        let dragged_outside = br#"[
+          {"id": 11, "pid": 55, "title": "presenced:widget-main", "layout": {"tile_pos_in_workspace_view": [600.0, 330.0], "window_size": [720, 420]}},
+          {"id": 12, "pid": 55, "title": "presenced:widget-rvc", "layout": {"tile_pos_in_workspace_view": [-1.0, 334.0], "window_size": [250, 190]}}
+        ]"#;
+        assert!(drag_snapshot_from_payload(dragged_outside, 55, WidgetId::Rvc, output).is_err());
+
+        let main_outside = br#"[
+          {"id": 11, "pid": 55, "title": "presenced:widget-main", "layout": {"tile_pos_in_workspace_view": [1500.0, 330.0], "window_size": [720, 420]}},
+          {"id": 12, "pid": 55, "title": "presenced:widget-rvc", "layout": {"tile_pos_in_workspace_view": [345.0, 334.0], "window_size": [250, 190]}}
+        ]"#;
+        assert!(cluster_geometry_from_payload(main_outside, 55, output).is_err());
+        assert!(drag_snapshot_from_payload(main_outside, 55, WidgetId::Rvc, output).is_err());
+    }
+
+    #[test]
+    fn completed_drag_requires_real_movement_and_stable_main_output() {
+        let output = Rect {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        };
+        let origin = super::DragSnapshotPayload {
+            dragged: Rect {
+                x: 340,
+                y: 330,
+                width: 250,
+                height: 190,
+            },
+            main: Rect {
+                x: 600,
+                y: 330,
+                width: 720,
+                height: 420,
+            },
+            output,
+        };
+        let moved = super::DragSnapshotPayload {
+            dragged: Rect {
+                x: 350,
+                ..origin.dragged
+            },
+            ..origin
+        };
+
+        assert!(validate_completed_drag(origin, moved).is_ok());
+        assert!(validate_completed_drag(origin, origin).is_err());
+        assert!(validate_completed_drag(
+            origin,
+            super::DragSnapshotPayload {
+                main: Rect {
+                    x: 601,
+                    ..origin.main
+                },
+                ..moved
+            }
+        )
+        .is_err());
+        assert!(validate_completed_drag(
+            origin,
+            super::DragSnapshotPayload {
+                output: Rect {
+                    width: 1280,
+                    ..output
+                },
+                ..moved
+            }
+        )
+        .is_err());
     }
 
     #[test]

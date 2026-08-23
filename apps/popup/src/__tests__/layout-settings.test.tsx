@@ -116,6 +116,20 @@ describe("TutorialOverlay first-run layout selection", () => {
     expect(localStorage.setItem).toHaveBeenCalledWith("presenced-tutorial-seen", "true");
   });
 
+  it("keeps the seen marker unset and tutorial open when saving fails", async () => {
+    const onFinish = vi.fn().mockRejectedValue(new Error("layout save failed"));
+    const onSkip = vi.fn().mockResolvedValue(undefined);
+    await act(async () => {
+      renderer = create(<TutorialOverlay onFinish={onFinish} onSkip={onSkip} />);
+    });
+
+    await act(async () => renderer!.root.findByProps({ "aria-label": "Finish tutorial" }).props.onClick());
+
+    expect(localStorage.setItem).not.toHaveBeenCalled();
+    expect(renderer!.root.findByProps({ role: "alert" }).props.children).toBe("layout save failed");
+    expect(renderer!.root.findByProps({ "aria-label": "Finish tutorial" })).toBeDefined();
+  });
+
   it("skip writes the main-only selection and leaves every optional window hidden", async () => {
     const onFinish = vi.fn().mockResolvedValue(undefined);
     const onSkip = vi.fn().mockResolvedValue(undefined);
