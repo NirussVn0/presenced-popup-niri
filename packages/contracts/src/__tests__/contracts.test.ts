@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { describe, it, expect } from "vitest";
 import {
   DesktopFactSchema,
@@ -10,6 +11,25 @@ import {
 } from "../index.js";
 
 describe("@presenced/contracts", () => {
+  it("keeps TypeScript build metadata out of source control", () => {
+    const repositoryRoot = execFileSync("git", ["rev-parse", "--show-toplevel"], {
+      encoding: "utf8",
+    }).trim();
+    const trackedBuildMetadata = execFileSync("git", ["ls-files", "--", "*.tsbuildinfo"], {
+      cwd: repositoryRoot,
+      encoding: "utf8",
+    }).trim();
+
+    expect(trackedBuildMetadata).toBe("");
+    expect(() =>
+      execFileSync(
+        "git",
+        ["check-ignore", "--no-index", "--quiet", "packages/contracts/tsconfig.tsbuildinfo"],
+        { cwd: repositoryRoot },
+      ),
+    ).not.toThrow();
+  });
+
   it("validates DesktopFact correctly", () => {
     const valid = {
       kind: "desktop",

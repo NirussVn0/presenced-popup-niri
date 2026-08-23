@@ -9,6 +9,7 @@ src-tauri/gen/
 release-artifacts/
 
 # Build outputs
+*.tsbuildinfo
 dist/
 build/
 out/
