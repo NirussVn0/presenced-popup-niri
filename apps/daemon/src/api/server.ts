@@ -82,7 +82,10 @@ export class ApiServer {
           if (
             origin.startsWith("http://localhost:") ||
             origin.startsWith("http://127.0.0.1:") ||
-            origin.startsWith("http://[::1]:")
+            origin.startsWith("http://[::1]:") ||
+            origin === "tauri://localhost" ||
+            origin === "http://tauri.localhost" ||
+            origin === "https://tauri.localhost"
           ) {
             return origin;
           }

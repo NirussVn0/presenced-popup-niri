@@ -1,1 +1,1 @@
-{}
+{"widget-cluster":{"identifier":"widget-cluster","description":"Permissions required by the local presenced widget cluster.","local":true,"windows":["widget-*"],"permissions":["core:default","core:event:allow-emit"]}}

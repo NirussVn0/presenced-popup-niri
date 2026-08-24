@@ -7,8 +7,11 @@ const rootFile = (path: string) =>
 describe("Niri popup integration", () => {
   it("ships a floating rule for the runtime app id and fixed popup size", () => {
     const rule = rootFile("niri/presenced-popup-niri.kdl");
+    const cargoManifest = rootFile("apps/popup/src-tauri/Cargo.toml");
+    const runtimeAppId = cargoManifest.match(/^name = "([^"]+)"$/m)?.[1];
 
-    expect(rule).toContain('match app-id="^presenced-popup-niri$"');
+    expect(runtimeAppId).toBeDefined();
+    expect(rule).toContain(`match app-id="^${runtimeAppId}$"`);
     expect(rule).toContain("open-floating true");
     expect(rule).toContain("open-focused true");
     expect(rule).toContain("default-column-width { fixed 720; }");
@@ -36,5 +39,15 @@ describe("Niri popup integration", () => {
     expect(tauriConfig.app.windows[0].center).toBe(true);
     expect(tauriConfig.app.windows[0].alwaysOnTop).toBe(true);
     expect(tauriConfig.app.windows[0].skipTaskbar).toBe(true);
+  });
+
+  it("grants widget windows the Tauri event permission used during startup", () => {
+    const capability = JSON.parse(
+      rootFile("apps/popup/src-tauri/capabilities/widget-cluster.json"),
+    );
+
+    expect(capability.windows).toContain("widget-*");
+    expect(capability.permissions).toContain("core:default");
+    expect(capability.permissions).toContain("core:event:allow-emit");
   });
 });

@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "widget-cluster",
+  "description": "Permissions required by the local presenced widget cluster.",
+  "windows": ["widget-*"],
+  "permissions": ["core:default", "core:event:allow-emit"]
+}

@@ -1144,7 +1144,11 @@ pub(crate) async fn initialize_widget_windows(
         .map_err(|_| "window cluster state is unavailable".to_owned())?
         .generations
         .request();
-    apply_validated_layout(state, layout, generation).await
+    let result = apply_validated_layout(state, layout, generation).await;
+    if let Err(error) = &result {
+        eprintln!("presenced-popup: failed to initialize widget windows: {error}");
+    }
+    result
 }
 
 #[tauri::command]

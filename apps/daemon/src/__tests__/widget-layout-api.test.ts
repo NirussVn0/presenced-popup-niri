@@ -36,6 +36,28 @@ describe("Widget layout API", () => {
     expect(await response.json()).toEqual(DEFAULT_CLUSTER_LAYOUT);
   });
 
+  it.each([
+    "tauri://localhost",
+    "http://tauri.localhost",
+    "https://tauri.localhost",
+  ])("allows the official Tauri origin %s", async (origin) => {
+    const response = await server.getApp().request("/api/settings/widgets", {
+      headers: { Origin: origin },
+    });
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("access-control-allow-origin")).toBe(origin);
+  });
+
+  it("does not allow an untrusted Tauri-like origin", async () => {
+    const response = await server.getApp().request("/api/settings/widgets", {
+      headers: { Origin: "https://evil.tauri.localhost" },
+    });
+
+    expect(response.status).toBe(200);
+    expect(response.headers.has("access-control-allow-origin")).toBe(false);
+  });
+
   it("persists and returns a validated layout from PUT /api/settings/widgets", async () => {
     const layout: ClusterLayoutV1 = {
       version: 1,
