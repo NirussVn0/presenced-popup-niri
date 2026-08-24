@@ -26,6 +26,7 @@ Niri desktop → presenced daemon → Discord RPC (official / Equicord / Vencord
 Works with **official Discord**, **Equicord**, and **Vencord** via the standard Discord IPC socket.
 
 It delivers:
+
 1. **The Daemon (`apps/daemon`)**: A headless background engine that processes real-time Niri + MPRIS event streams, resolves conflicting desktop activities using deterministic priority weighting, matches synced lyrics, and publishes rate-controlled Discord Rich Presence.
 2. **The Companion Popup (`apps/popup`)**: A floating Tauri v2 desktop companion (React 19, WebKit2GTK) featuring glassmorphic UI, animated audio waveform, 3-line focused lyrics, interactive media controls, Pomodoro timers, and slide-over settings.
 3. **The Web Dashboard (`apps/web`)**: A diagnostic control center for configuring rules, overrides, and integrations.
@@ -72,6 +73,7 @@ It delivers:
 ### 1. Install System Dependencies
 
 #### Arch Linux / CachyOS / Manjaro
+
 ```bash
 sudo pacman -S --needed \
   nodejs \
@@ -86,6 +88,7 @@ sudo pacman -S --needed \
 ```
 
 #### Fedora (40+)
+
 ```bash
 sudo dnf install \
   nodejs \
@@ -100,6 +103,7 @@ sudo dnf install \
 ```
 
 #### Ubuntu / Debian (24.04+)
+
 ```bash
 sudo apt update && sudo apt install -y \
   nodejs \
@@ -136,11 +140,13 @@ pnpm build
 ### 3. Run in Development Mode
 
 Run the background daemon in one terminal:
+
 ```bash
 pnpm daemon:dev
 ```
 
 Launch the companion popup in a second terminal:
+
 ```bash
 pnpm popup:dev
 ```
@@ -159,6 +165,7 @@ pnpm --filter @presenced/popup build
 cd apps/popup/src-tauri
 cargo build --release
 ```
+
 The compiled companion binary will be available at `apps/popup/src-tauri/target/release/presenced-popup`.
 
 ---
@@ -212,21 +219,23 @@ window-rule {
 
 ---
 
-## 🎭 Scene Profiles & Priority Matrix
+## 🎭 Scene Profiles &amp; Priority Matrix
 
-| Scene | Trigger / Mode | Discord Details | Discord State |
-| :--- | :--- | :--- | :--- |
-| **Auto** | Default resolver | Context-dependent | Context-dependent |
-| **Music** | MPRIS playing | `{track} - {artist}` | `{lyric}` (Synced lyrics) |
-| **Focus** | Deep work mode | `{app}` | `{title}` |
-| **Pomodoro** | Active timer | `Focus: {pomodoro.task}` | `{pomodoro.remaining} left` |
-| **Countdown**| Milestone target | `{countdown.title}` | `{countdown.days}d {countdown.hours}h left` |
-| **System** | Telemetry mode | `{hostname} (CPU: {system.cpu}%)`| `RAM: {system.ram}%` |
-| **Privacy** | Hidden titles | `Using Linux Desktop` | `Focusing` |
+
+| Scene         | Trigger / Mode   | Discord Details                   | Discord State                               |
+| :------------- | :---------------- | :--------------------------------- | :------------------------------------------- |
+| **Auto**      | Default resolver | Context-dependent                 | Context-dependent                           |
+| **Music**     | MPRIS playing    | `{track} - {artist}`              | `{lyric}` (Synced lyrics)                   |
+| **Focus**     | Deep work mode   | `{app}`                           | `{title}`                                   |
+| **Pomodoro**  | Active timer     | `Focus: {pomodoro.task}`          | `{pomodoro.remaining} left`                 |
+| **Countdown** | Milestone target | `{countdown.title}`               | `{countdown.days}d {countdown.hours}h left` |
+| **System**    | Telemetry mode   | `{hostname} (CPU: {system.cpu}%)` | `RAM: {system.ram}%`                        |
+| **Privacy**   | Hidden titles    | `Using Linux Desktop`             | `Focusing`                                  |
+
 
 ---
 
-## 🧪 Testing & Quality Gates
+## 🧪 Testing &amp; Quality Gates
 
 The project maintains strict TypeScript typings and unit/integration test coverage:
 
