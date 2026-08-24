@@ -19,6 +19,24 @@ import { CountdownEngine } from "../sources/countdown/countdown-engine.js";
 import { MprisSource } from "../sources/mpris/mpris-source.js";
 import { TokenManager } from "../auth/token-manager.js";
 
+const TRUSTED_TAURI_ORIGINS = new Set([
+  "tauri://localhost",
+  "http://tauri.localhost",
+  "https://tauri.localhost",
+]);
+
+function isTrustedLocalOrigin(origin: string): boolean {
+  if (TRUSTED_TAURI_ORIGINS.has(origin)) return true;
+
+  try {
+    const url = new URL(origin);
+    return url.protocol === "http:"
+      && ["localhost", "127.0.0.1", "[::1]", "::1"].includes(url.hostname);
+  } catch {
+    return false;
+  }
+}
+
 export interface ApiServerOptions {
   port?: number;
   host?: string;
@@ -78,18 +96,7 @@ export class ApiServer {
       "/*",
       cors({
         origin: (origin) => {
-          if (!origin) return null;
-          if (
-            origin.startsWith("http://localhost:") ||
-            origin.startsWith("http://127.0.0.1:") ||
-            origin.startsWith("http://[::1]:") ||
-            origin === "tauri://localhost" ||
-            origin === "http://tauri.localhost" ||
-            origin === "https://tauri.localhost"
-          ) {
-            return origin;
-          }
-          return null;
+          return origin && isTrustedLocalOrigin(origin) ? origin : null;
         },
         allowMethods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
         allowHeaders: ["Content-Type"],
@@ -406,6 +413,13 @@ export class ApiServer {
     this.wss = new WebSocketServer({
       server,
       path: "/api/events",
+      verifyClient: ({ origin }, done) => {
+        if (!origin || isTrustedLocalOrigin(origin)) {
+          done(true);
+          return;
+        }
+        done(false, 403, "Forbidden");
+      },
     });
 
     this.wss.on("connection", (ws: WebSocket) => {

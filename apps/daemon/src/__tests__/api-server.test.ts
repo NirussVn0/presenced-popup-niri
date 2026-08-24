@@ -93,4 +93,38 @@ describe("API & WebSocket Server", () => {
 
     ws.close();
   });
+
+  it.each([
+    "tauri://localhost",
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "http://[::1]:5173",
+  ])("allows the trusted WebSocket origin %s", async (origin) => {
+    const ws = new WebSocket(`ws://127.0.0.1:${server.getPort()}/api/events`, {
+      headers: { Origin: origin },
+    });
+    const initialEvent = new Promise<DaemonEvent>((resolve, reject) => {
+      ws.once("message", (data) => resolve(JSON.parse(data.toString())));
+      ws.once("error", reject);
+    });
+
+    await expect(initialEvent).resolves.toMatchObject({ type: "state.snapshot" });
+    ws.close();
+  });
+
+  it("rejects hostile WebSocket origins before sending state", async () => {
+    const ws = new WebSocket(`ws://127.0.0.1:${server.getPort()}/api/events`, {
+      headers: { Origin: "https://evil.example" },
+    });
+    const statusCode = await new Promise<number>((resolve, reject) => {
+      ws.once("open", () => reject(new Error("hostile WebSocket origin connected")));
+      ws.once("error", () => undefined);
+      ws.once("unexpected-response", (_request, response) => {
+        response.resume();
+        resolve(response.statusCode ?? 0);
+      });
+    });
+
+    expect(statusCode).toBe(403);
+  });
 });
