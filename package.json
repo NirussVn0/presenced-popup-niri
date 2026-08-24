@@ -6,6 +6,7 @@
   "scripts": {
     "build": "pnpm -r --if-present run build",
     "dev": "pnpm --parallel -r --if-present run dev",
+    "pretest": "pnpm --filter @presenced/core... run build",
     "pretypecheck": "pnpm --filter @presenced/core... run build",
     "typecheck": "pnpm -r --if-present run typecheck",
     "test": "vitest run",

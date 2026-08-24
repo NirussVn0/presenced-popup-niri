@@ -32,7 +32,7 @@ describe("@presenced/contracts", () => {
     ).not.toThrow();
   });
 
-  it("bootstraps workspace declaration files before root typecheck", () => {
+  it("bootstraps workspace outputs before root test and typecheck gates", () => {
     const repositoryRoot = execFileSync("git", ["rev-parse", "--show-toplevel"], {
       encoding: "utf8",
     }).trim();
@@ -41,6 +41,9 @@ describe("@presenced/contracts", () => {
     ) as { scripts: Record<string, string> };
 
     expect(rootPackage.scripts.pretypecheck).toBe(
+      "pnpm --filter @presenced/core... run build",
+    );
+    expect(rootPackage.scripts.pretest).toBe(
       "pnpm --filter @presenced/core... run build",
     );
   });
