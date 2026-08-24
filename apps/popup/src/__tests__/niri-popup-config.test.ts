@@ -41,12 +41,13 @@ describe("Niri popup integration", () => {
     expect(tauriConfig.app.windows[0].skipTaskbar).toBe(true);
   });
 
-  it("grants widget windows the Tauri event permission used during startup", () => {
+  it("grants every cluster webview the Tauri permissions it uses", () => {
     const capability = JSON.parse(
       rootFile("apps/popup/src-tauri/capabilities/widget-cluster.json"),
     );
 
     expect(capability.windows).toContain("widget-*");
+    expect(capability.windows).toContain("settings");
     expect(capability.permissions).toContain("core:default");
     expect(capability.permissions).toContain("core:event:allow-emit");
   });
