@@ -78,7 +78,7 @@ export class ApiServer {
       "/*",
       cors({
         origin: (origin) => {
-          if (!origin) return "*";
+          if (!origin) return null;
           if (
             origin.startsWith("http://localhost:") ||
             origin.startsWith("http://127.0.0.1:") ||

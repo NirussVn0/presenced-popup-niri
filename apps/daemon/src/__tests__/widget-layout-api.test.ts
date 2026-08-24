@@ -36,6 +36,13 @@ describe("Widget layout API", () => {
     expect(await response.json()).toEqual(DEFAULT_CLUSTER_LAYOUT);
   });
 
+  it("does not emit a wildcard CORS origin when Origin is absent", async () => {
+    const response = await server.getApp().request("/api/settings/widgets");
+
+    expect(response.status).toBe(200);
+    expect(response.headers.has("access-control-allow-origin")).toBe(false);
+  });
+
   it.each([
     "tauri://localhost",
     "http://tauri.localhost",
