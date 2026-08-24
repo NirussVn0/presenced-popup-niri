@@ -1,4 +1,6 @@
 import { execFileSync } from "node:child_process";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { describe, it, expect } from "vitest";
 import {
   DesktopFactSchema,
@@ -28,6 +30,19 @@ describe("@presenced/contracts", () => {
         { cwd: repositoryRoot },
       ),
     ).not.toThrow();
+  });
+
+  it("bootstraps workspace declaration files before root typecheck", () => {
+    const repositoryRoot = execFileSync("git", ["rev-parse", "--show-toplevel"], {
+      encoding: "utf8",
+    }).trim();
+    const rootPackage = JSON.parse(
+      readFileSync(join(repositoryRoot, "package.json"), "utf8"),
+    ) as { scripts: Record<string, string> };
+
+    expect(rootPackage.scripts.pretypecheck).toBe(
+      "pnpm --filter @presenced/core... run build",
+    );
   });
 
   it("validates DesktopFact correctly", () => {
