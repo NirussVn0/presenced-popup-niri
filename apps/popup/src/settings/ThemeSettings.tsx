@@ -4,20 +4,13 @@
 import { useState, useEffect } from "react";
 import { motion } from "framer-motion";
 import { springSnap } from "../lib/animations.js";
+import { THEME_PRESETS } from "../lib/theme-presets.js";
 import type { ThemeConfig } from "../hooks/useTheme.js";
 
 interface ThemeSettingsProps {
   onSave: (config: ThemeConfig) => Promise<void>;
   onLoad: () => Promise<ThemeConfig>;
 }
-
-const PRESETS: { name: string; color: string }[] = [
-  { name: "Niri Blue", color: "#7c8aff" },
-  { name: "Cyber Green", color: "#34d399" },
-  { name: "Warm Amber", color: "#fbbf24" },
-  { name: "Neon Purple", color: "#a78bfa" },
-  { name: "Rose Gold", color: "#f472b6" },
-];
 
 const DEFAULT_THEME: ThemeConfig = {
   accentColor: "#7c8aff",
@@ -62,7 +55,7 @@ export const ThemeSettings = ({ onSave, onLoad }: ThemeSettingsProps) => {
       <div className="space-y-1.5">
         <label className="text-text-secondary font-semibold">Presets</label>
         <div className="flex flex-wrap gap-1.5">
-          {PRESETS.map((preset) => (
+          {THEME_PRESETS.map((preset) => (
             <button key={preset.name} type="button" onClick={() => update({ accentColor: preset.color })} className={`flex items-center gap-1.5 px-2 py-1 rounded-niri text-2xs transition-colors ${config.accentColor === preset.color ? "ring-2 ring-accent-primary" : "glass-surface hover:bg-surface-hover"}`}>
               <span className="w-3 h-3 rounded-full" style={{ backgroundColor: preset.color }} />
               <span className="text-text-primary">{preset.name}</span>
