@@ -18,6 +18,8 @@ import {
   ClusterLayoutV1,
   ClusterLayoutV1Schema,
   DEFAULT_CLUSTER_LAYOUT,
+  ThemeSettingsV1,
+  migrateThemeSettings,
 } from "@presenced/contracts";
 import { resolvePresence, ResolverResult, SceneResolver } from "@presenced/core";
 
@@ -147,6 +149,26 @@ export class PresenceStore extends EventEmitter {
       payload: layout,
     };
     this.emit("event", event);
+  }
+
+  public getThemeSettings(): ThemeSettingsV1 {
+    return this.database?.getThemeSettings() ?? migrateThemeSettings(null);
+  }
+
+  public setThemeSettings(theme: ThemeSettingsV1): ThemeSettingsV1 {
+    let canonical: ThemeSettingsV1;
+    if (this.database) {
+      this.database.putThemeSettings(theme);
+      canonical = this.database.getThemeSettings();
+    } else {
+      canonical = migrateThemeSettings(theme);
+    }
+    const event: DaemonEvent = {
+      type: "theme.settings.changed",
+      payload: canonical,
+    };
+    this.emit("event", event);
+    return canonical;
   }
 
   public setHealth(health: IntegrationHealth): void {

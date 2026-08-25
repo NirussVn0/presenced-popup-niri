@@ -10,3 +10,4 @@ export * from "./pomodoro.js";
 export * from "./countdowns.js";
 export * from "./system.js";
 export * from "./widget-layout.js";
+export * from "./theme.js";

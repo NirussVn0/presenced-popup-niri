@@ -9,6 +9,9 @@ import {
   DEFAULT_PRIORITIES,
   LyricsPayload,
   CountdownItem,
+  ThemeSettingsV1,
+  ThemeSettingsV1Schema,
+  migrateThemeSettings,
 } from "@presenced/contracts";
 
 export interface DatabaseOptions {
@@ -70,6 +73,12 @@ export class DatabaseManager {
         enabled INTEGER NOT NULL DEFAULT 1,
         show_on_discord INTEGER NOT NULL DEFAULT 0,
         created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS theme_settings (
+        id TEXT PRIMARY KEY,
+        payload TEXT NOT NULL,
         updated_at INTEGER NOT NULL
       );
     `);
@@ -307,6 +316,30 @@ export class DatabaseManager {
       ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
     `);
     stmt.run("rvc_config", JSON.stringify(config), Date.now());
+  }
+
+  // ── Theme settings (canonical JSON) ───────────────────────────────────
+
+  public getThemeSettings(): ThemeSettingsV1 {
+    try {
+      const row = this.db
+        .prepare("SELECT payload FROM theme_settings WHERE id = ?")
+        .get("v1") as { payload: string } | undefined;
+      if (!row) return migrateThemeSettings(null);
+      return ThemeSettingsV1Schema.parse(JSON.parse(row.payload));
+    } catch {
+      return migrateThemeSettings(null);
+    }
+  }
+
+  public putThemeSettings(theme: ThemeSettingsV1): void {
+    const canonical = ThemeSettingsV1Schema.parse(theme);
+    const stmt = this.db.prepare(`
+      INSERT INTO theme_settings (id, payload, updated_at)
+      VALUES (?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET payload = excluded.payload, updated_at = excluded.updated_at
+    `);
+    stmt.run("v1", JSON.stringify(canonical), Date.now());
   }
 
   public close(): void {

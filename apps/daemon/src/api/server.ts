@@ -12,6 +12,7 @@ import {
   PresenceRulesSchema,
   DaemonEvent,
   ClusterLayoutV1Schema,
+  ThemeSettingsV1Schema,
 } from "@presenced/contracts";
 import { PresenceStore } from "../state/presence-store.js";
 import { PomodoroEngine } from "../sources/pomodoro/pomodoro-engine.js";
@@ -281,6 +282,27 @@ export class ApiServer {
     // Rules endpoints
     this.app.get("/api/rules", (c) => {
       return c.json(this.store.getRules());
+    });
+
+    // Theme settings endpoints
+    this.app.get("/api/theme", (c) => {
+      return c.json(this.store.getThemeSettings());
+    });
+
+    this.app.put("/api/theme", async (c) => {
+      let body: unknown;
+      try {
+        body = await c.req.json();
+      } catch {
+        return c.json({ error: "invalid_theme_config" }, 400);
+      }
+
+      const parsed = ThemeSettingsV1Schema.safeParse(body);
+      if (!parsed.success) {
+        return c.json({ error: "invalid_theme_config" }, 400);
+      }
+      const saved = this.store.setThemeSettings(parsed.data);
+      return c.json(saved);
     });
 
     // Discord config endpoints
