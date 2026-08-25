@@ -36,6 +36,7 @@ interface SettingsPanelProps {
   saveRvcConfig: (config: { enabled: boolean; tickIntervalSec: number; entries: any[] }) => Promise<void>;
   loadTheme: () => Promise<ThemeConfig>;
   saveTheme: (config: ThemeConfig) => Promise<void>;
+  themeDegraded?: boolean;
 }
 
 const TABS: { id: SettingsTab; label: string; icon: React.ComponentType<{ className?: string }> }[] = [
@@ -63,7 +64,7 @@ export const SettingsPanel = ({
   visibility, toggleWidget,
   getDiscordConfig, saveDiscordConfig,
   getRvcConfig, saveRvcConfig,
-  loadTheme, saveTheme,
+  loadTheme, saveTheme, themeDegraded,
 }: SettingsPanelProps) => {
   const [activeTab, setActiveTab] = useState<SettingsTab>("widgets");
   const [discordClientId, setDiscordClientId] = useState("");
@@ -142,7 +143,7 @@ export const SettingsPanel = ({
         )}
 
         {activeTab === "rvc" && <RvcSettings onSave={saveRvcConfig} onLoad={getRvcConfig} />}
-        {activeTab === "theme" && <ThemeSettings onSave={saveTheme} onLoad={loadTheme} />}
+        {activeTab === "theme" && <ThemeSettings onSave={saveTheme} onLoad={loadTheme} degraded={themeDegraded ?? false} />}
         {activeTab === "quotes" && <QuoteSettings onSave={async () => {}} onLoad={async () => []} />}
 
         {activeTab === "discord" && (

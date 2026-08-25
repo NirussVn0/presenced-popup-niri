@@ -1,25 +1,38 @@
-import { useCallback, useEffect, useState } from "react";
+/**
+ * useTheme — theme sourced from the daemon API, cached in localStorage.
+ *
+ * Source of truth: GET/PUT http://127.0.0.1:4242/api/theme plus the
+ * theme.settings.changed WebSocket broadcast. localStorage holds ONLY the
+ * last-known cache so popups can keep rendering when the daemon is down.
+ */
+import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  DaemonEventSchema,
+  DEFAULT_THEME_SETTINGS,
+  migrateThemeSettings,
+  ThemeSettingsV1,
+} from "@presenced/contracts";
 
-export interface ThemeConfig {
-  accentColor: string;
-  glassOpacity: number;
-  blurIntensity: number;
-  borderStyle: "subtle" | "glowing" | "neon";
-  clockStyle: "digital" | "minimal";
-}
+const API_HTTP_URL = "http://127.0.0.1:4242/api";
+const API_WS_URL = "ws://127.0.0.1:4242/api/events";
 
+/** Legacy-compatible alias: the v1 theme contract shape. */
+export type ThemeConfig = Omit<ThemeSettingsV1, "version">;
+
+/** Kept for existing consumers; identical values to the v1 contract default. */
 export const DEFAULT_THEME: ThemeConfig = {
-  accentColor: "#7c8aff",
-  glassOpacity: 45,
-  blurIntensity: 24,
-  borderStyle: "subtle",
-  clockStyle: "digital",
+  accentColor: DEFAULT_THEME_SETTINGS.accentColor,
+  glassOpacity: DEFAULT_THEME_SETTINGS.glassOpacity,
+  blurIntensity: DEFAULT_THEME_SETTINGS.blurIntensity,
+  borderStyle: DEFAULT_THEME_SETTINGS.borderStyle,
+  clockStyle: DEFAULT_THEME_SETTINGS.clockStyle,
 };
 
-const STORAGE_KEY = "presenced-theme-v1";
+const THEME_CACHE_KEY = "presenced-theme-v1";
+const RECONNECT_MS = 2000;
 
 export function normalizeHex(color: string): string {
-  return /^#[0-9a-f]{6}$/i.test(color) ? color : DEFAULT_THEME.accentColor;
+  return /^#[0-9a-fA-F]{6}$/.test(color) ? color : DEFAULT_THEME.accentColor;
 }
 
 export function hexToRgb(color: string): [number, number, number] {
@@ -31,24 +44,33 @@ export function hexToRgb(color: string): [number, number, number] {
   ];
 }
 
-function loadStoredTheme(): ThemeConfig {
+function readRawCache(): unknown {
   try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    if (!raw) return DEFAULT_THEME;
-    const parsed = JSON.parse(raw) as Partial<ThemeConfig>;
-    return {
-      accentColor: normalizeHex(parsed.accentColor ?? DEFAULT_THEME.accentColor),
-      glassOpacity: Math.min(80, Math.max(10, parsed.glassOpacity ?? DEFAULT_THEME.glassOpacity)),
-      blurIntensity: Math.min(40, Math.max(8, parsed.blurIntensity ?? DEFAULT_THEME.blurIntensity)),
-      borderStyle: parsed.borderStyle ?? DEFAULT_THEME.borderStyle,
-      clockStyle: parsed.clockStyle ?? DEFAULT_THEME.clockStyle,
-    };
+    if (typeof localStorage === "undefined") return null;
+    const raw = localStorage.getItem(THEME_CACHE_KEY);
+    return raw ? JSON.parse(raw) : null;
   } catch {
-    return DEFAULT_THEME;
+    return null;
   }
 }
 
-function applyTheme(config: ThemeConfig): void {
+function loadCachedTheme(): ThemeConfig {
+  const migrated = migrateThemeSettings(readRawCache());
+  const { version: _version, ...rest } = migrated;
+  return rest;
+}
+
+function writeCachedTheme(theme: ThemeConfig): void {
+  try {
+    if (typeof localStorage === "undefined") return;
+    localStorage.setItem(THEME_CACHE_KEY, JSON.stringify({ ...theme, version: 1 }));
+  } catch {
+    // cache write failures must never break theming
+  }
+}
+
+export function applyTheme(config: ThemeConfig): void {
+  if (typeof document === "undefined") return;
   const root = document.documentElement;
   const [r, g, b] = hexToRgb(config.accentColor);
   root.style.setProperty("--accent-color", config.accentColor);
@@ -61,20 +83,170 @@ function applyTheme(config: ThemeConfig): void {
   root.dataset.themeBorder = config.borderStyle;
 }
 
+async function fetchThemeFromDaemon(): Promise<ThemeSettingsV1 | null> {
+  try {
+    const res = await fetch(`${API_HTTP_URL}/theme`);
+    if (!res.ok) return null;
+    return migrateThemeSettings(await res.json());
+  } catch {
+    return null;
+  }
+}
+
+function stripVersion(theme: ThemeSettingsV1): ThemeConfig {
+  const { version: _version, ...rest } = theme;
+  return rest;
+}
+
+function sameTheme(a: ThemeConfig, b: ThemeConfig): boolean {
+  return (
+    a.accentColor === b.accentColor &&
+    a.glassOpacity === b.glassOpacity &&
+    a.blurIntensity === b.blurIntensity &&
+    a.borderStyle === b.borderStyle &&
+    a.clockStyle === b.clockStyle
+  );
+}
+
 export function useTheme() {
-  const [theme, setTheme] = useState<ThemeConfig>(loadStoredTheme);
+  const [theme, setTheme] = useState<ThemeConfig>(loadCachedTheme);
+  const [degraded, setDegraded] = useState<boolean>(true);
+  const wsRef = useRef<WebSocket | null>(null);
+  const reconnectTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const migratedLegacyThemeRef = useRef(false);
+  const themeRef = useRef(theme);
+  themeRef.current = theme;
 
   useEffect(() => {
     applyTheme(theme);
   }, [theme]);
 
-  const loadTheme = useCallback(async () => theme, [theme]);
+  /**
+   * One-time migration: if the daemon still serves defaults while the local
+   * cache carries an older customized theme, push the migrated cache up once.
+   */
+  const syncWithDaemon = useCallback(async (): Promise<void> => {
+    const remote = await fetchThemeFromDaemon();
+    if (!remote) {
+      setDegraded(true);
+      return;
+    }
 
-  const saveTheme = useCallback(async (next: ThemeConfig) => {
-    const normalized = { ...next, accentColor: normalizeHex(next.accentColor) };
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(normalized));
-    setTheme(normalized);
+    let next = remote;
+    if (!migratedLegacyThemeRef.current) {
+      migratedLegacyThemeRef.current = true;
+      const legacyMigrated = migrateThemeSettings(readRawCache());
+      if (!sameTheme(stripVersion(legacyMigrated), DEFAULT_THEME) && sameTheme(stripVersion(remote), DEFAULT_THEME)) {
+        try {
+          const res = await fetch(`${API_HTTP_URL}/theme`, {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(legacyMigrated),
+          });
+          if (res.ok) {
+            const saved = migrateThemeSettings(await res.json());
+            next = saved;
+          }
+        } catch {
+          // daemon unreachable again — stay degraded with cached rendering
+        }
+      }
+    }
+
+    const nextConfig = stripVersion(next);
+    writeCachedTheme(nextConfig);
+    setTheme((prev) => (sameTheme(prev, nextConfig) ? prev : nextConfig));
+    setDegraded(false);
   }, []);
 
-  return { theme, loadTheme, saveTheme };
+  useEffect(() => {
+    void syncWithDaemon();
+
+    if (typeof WebSocket === "undefined") return;
+
+    const connectWebSocket = () => {
+      if (
+        wsRef.current &&
+        (wsRef.current.readyState === WebSocket.OPEN ||
+          wsRef.current.readyState === WebSocket.CONNECTING)
+      ) {
+        return;
+      }
+
+      try {
+        const ws = new WebSocket(API_WS_URL);
+        wsRef.current = ws;
+
+        ws.onopen = () => {
+          void syncWithDaemon();
+        };
+
+        ws.onmessage = (event) => {
+          try {
+            const parsed = DaemonEventSchema.safeParse(JSON.parse(event.data));
+            if (!parsed.success || parsed.data.type !== "theme.settings.changed") return;
+            const nextConfig = stripVersion(parsed.data.payload);
+            writeCachedTheme(nextConfig);
+            setTheme((prev) => (sameTheme(prev, nextConfig) ? prev : nextConfig));
+            setDegraded(false);
+          } catch {
+            // ignore malformed frames
+          }
+        };
+
+        ws.onclose = () => {
+          setDegraded(true);
+          wsRef.current = null;
+          reconnectTimeoutRef.current = setTimeout(connectWebSocket, RECONNECT_MS);
+        };
+
+        ws.onerror = () => {
+          ws.close();
+        };
+      } catch {
+        setDegraded(true);
+        reconnectTimeoutRef.current = setTimeout(connectWebSocket, RECONNECT_MS);
+      }
+    };
+
+    connectWebSocket();
+
+    return () => {
+      if (reconnectTimeoutRef.current) clearTimeout(reconnectTimeoutRef.current);
+      const ws = wsRef.current;
+      if (ws) {
+        ws.onopen = null;
+        ws.onmessage = null;
+        ws.onclose = null;
+        ws.onerror = null;
+        ws.close();
+      }
+      wsRef.current = null;
+    };
+  }, [syncWithDaemon]);
+
+  /** Current known theme (daemon value when reachable, cache otherwise). */
+  const loadTheme = useCallback(async (): Promise<ThemeConfig> => themeRef.current, []);
+
+  /** Explicit persist: PUT to the daemon and keep the cache warm either way. */
+  const saveTheme = useCallback(async (next: ThemeConfig): Promise<void> => {
+    const normalized = stripVersion(
+      migrateThemeSettings({ ...next, accentColor: normalizeHex(next.accentColor) })
+    );
+    writeCachedTheme(normalized);
+    setTheme(normalized);
+    try {
+      const res = await fetch(`${API_HTTP_URL}/theme`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ...normalized, version: 1 }),
+      });
+      if (!res.ok) throw new Error(`HTTP error ${res.status}`);
+      setDegraded(false);
+    } catch {
+      setDegraded(true);
+    }
+  }, []);
+
+  return { theme, loadTheme, saveTheme, degraded };
 }

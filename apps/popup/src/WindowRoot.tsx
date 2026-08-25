@@ -164,7 +164,7 @@ function SettingsWindow() {
     saveRvcConfig,
   } = usePresenceCompanion();
   const { visibility, toggleWidget } = useWidgetConfig();
-  const { loadTheme, saveTheme } = useTheme();
+  const { loadTheme, saveTheme, degraded: themeDegraded } = useTheme();
   const closeSettings = () => {
     void invoke("close_window").catch((error: unknown) => {
       console.error("[presenced-popup] close_window failed", error);
@@ -203,6 +203,7 @@ function SettingsWindow() {
           saveRvcConfig={saveRvcConfig}
           loadTheme={loadTheme}
           saveTheme={saveTheme}
+          themeDegraded={themeDegraded}
         />
       </div>
     </main>

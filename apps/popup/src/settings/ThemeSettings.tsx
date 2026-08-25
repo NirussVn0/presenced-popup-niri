@@ -1,32 +1,54 @@
 /**
  * ThemeSettings — color, glass, clock style configuration.
+ *
+ * Edits preview locally (debounced CSS-variable application, no network);
+ * persistence happens only on explicit save via the daemon PUT.
  */
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { motion } from "framer-motion";
 import { springSnap } from "../lib/animations.js";
 import { THEME_PRESETS } from "../lib/theme-presets.js";
+import { DEFAULT_THEME as HOOK_DEFAULT, applyTheme } from "../hooks/useTheme.js";
 import type { ThemeConfig } from "../hooks/useTheme.js";
 
 interface ThemeSettingsProps {
   onSave: (config: ThemeConfig) => Promise<void>;
   onLoad: () => Promise<ThemeConfig>;
+  degraded?: boolean;
 }
 
-const DEFAULT_THEME: ThemeConfig = {
-  accentColor: "#7c8aff",
-  glassOpacity: 45,
-  blurIntensity: 24,
-  borderStyle: "subtle",
-  clockStyle: "digital",
-};
+const PREVIEW_DEBOUNCE_MS = 150;
 
-export const ThemeSettings = ({ onSave, onLoad }: ThemeSettingsProps) => {
-  const [config, setConfig] = useState<ThemeConfig>(DEFAULT_THEME);
+export const ThemeSettings = ({ onSave, onLoad, degraded = false }: ThemeSettingsProps) => {
+  const [config, setConfig] = useState<ThemeConfig>(HOOK_DEFAULT);
   const [saved, setSaved] = useState(false);
+  const persistedRef = useRef<ThemeConfig>(HOOK_DEFAULT);
 
   useEffect(() => {
-    onLoad().then(setConfig);
+    let cancelled = false;
+    onLoad().then((loaded) => {
+      if (cancelled) return;
+      persistedRef.current = loaded;
+      setConfig(loaded);
+    });
+    return () => {
+      cancelled = true;
+    };
   }, [onLoad]);
+
+  // Debounced local preview — never touches the network.
+  useEffect(() => {
+    const timer = setTimeout(() => applyTheme(config), PREVIEW_DEBOUNCE_MS);
+    return () => clearTimeout(timer);
+  }, [config]);
+
+  // Restore the last persisted theme when leaving without saving.
+  useEffect(
+    () => () => {
+      applyTheme(persistedRef.current);
+    },
+    []
+  );
 
   const update = (updates: Partial<ThemeConfig>) => {
     setConfig((prev) => ({ ...prev, ...updates }));
@@ -34,6 +56,7 @@ export const ThemeSettings = ({ onSave, onLoad }: ThemeSettingsProps) => {
 
   const handleSave = async () => {
     await onSave(config);
+    persistedRef.current = config;
     setSaved(true);
     setTimeout(() => setSaved(false), 2000);
   };
@@ -41,6 +64,12 @@ export const ThemeSettings = ({ onSave, onLoad }: ThemeSettingsProps) => {
   return (
     <div className="space-y-3 text-2xs">
       <h3 className="font-bold text-text-primary">Theme</h3>
+
+      <p role="status" className="text-text-muted">
+        {degraded
+          ? "Daemon offline — editing against the cached theme."
+          : "Synced with daemon theme."}
+      </p>
 
       {/* Accent color */}
       <div className="space-y-1.5">
@@ -98,7 +127,7 @@ export const ThemeSettings = ({ onSave, onLoad }: ThemeSettingsProps) => {
       <div className="space-y-1.5">
         <label className="text-text-secondary font-semibold">Clock Style</label>
         <div className="flex gap-1.5">
-          {(["digital", "minimal"] as const).map((style) => (
+          {(["digital", "analog", "minimal"] as const).map((style) => (
             <button key={style} type="button" onClick={() => update({ clockStyle: style })} className={`px-3 py-1 rounded-niri text-2xs capitalize transition-colors ${config.clockStyle === style ? "bg-accent-primary text-white font-bold" : "glass-surface text-text-secondary hover:text-text-primary"}`}>
               {style}
             </button>
