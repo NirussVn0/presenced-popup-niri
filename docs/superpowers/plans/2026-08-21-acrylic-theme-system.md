@@ -242,3 +242,14 @@ Capture all five presets, reduced motion, main-only, and cluster views. Obtain i
 - [ ] Verify outer acrylic and inner module colors remain measurably distinct.
 - [ ] Verify no widget-window document has `scrollWidth > clientWidth` or `scrollHeight > clientHeight`.
 - [ ] Run full TS/Rust/Tauri gates and independent visual/accessibility review.
+
+---
+
+## Implementation status (2026-08-25, feat/acrylic-theme-contract)
+
+Deviations from this plan, as actually shipped:
+
+- `ThemeSettingsV1` contract lives in `packages/contracts/src/theme.ts` with `clockStyle` enum `digital | analog | minimal` (this plan only listed digital/minimal).
+- Persistence: daemon table `theme_settings` via `GET/PUT /api/theme`; PUT validates with the zod schema (`invalid_theme_config` on 400) and broadcasts `theme.settings.changed`.
+- Cross-window sync uses the existing daemon WebSocket broadcast; the planned same-process `BroadcastChannel("presenced-theme")` fan-out was not needed.
+- `localStorage["presenced-theme-v1"]` is a last-known cache only. On popup start, if the cache holds an old customized theme and the daemon still serves defaults, the migrated object is PUT once.
